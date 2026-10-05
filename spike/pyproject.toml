@@ -1,0 +1,18 @@
+[project]
+name = "badminton-mover-spike"
+version = "0.1.0"
+description = "Throwaway spike: pose and foot-contact tracking on broadcast badminton clips"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "rtmlib",
+    "onnxruntime",
+    "opencv-python",
+    "numpy<3",
+    "torch>=2.14.1",
+    "pandas>=3.0.6",
+    "pillow>=12.3.0",
+    "gdown>=6.4.1",
+    "pycocotools>=2.0.11",
+    "matplotlib>=3.11.2",
+    "parse>=1.22.2",
+]

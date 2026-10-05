@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Video and outputs: broadcast footage is copyrighted and never goes in the repo
+*.mp4
+*.mov
+*.mkv
+*.webm
+spike/clips/*
+!spike/clips/.gitkeep
+spike/out/
+
+# Secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# Third-party code and model checkpoints for the spike
+spike/vendor/
+*.pt

@@ -151,8 +151,9 @@ export async function finishUpload(clipId: string, formData: FormData): Promise<
   return { ok: true };
 }
 
-// Starts the pre-scan again for a clip that failed (or never started).
-export async function retryPrescan(clipId: string): Promise<Result> {
+// Starts a failed clip again: the analysis if its reviewed rallies were sent for analysis (keeping
+// the review), otherwise the pre-scan.
+export async function retryClip(clipId: string): Promise<Result> {
   const member = await requireMember();
   const supabase = await createClient();
   const { data: clip } = await supabase.from("clips").select("id, owner_id, status").eq("id", clipId).maybeSingle();
@@ -160,8 +161,16 @@ export async function retryPrescan(clipId: string): Promise<Result> {
   if (clip.owner_id !== member.id && member.role !== "admin") return { ok: false, message: "Only the uploader or the admin can retry this clip." };
   if (!["failed", "uploaded"].includes(clip.status)) return { ok: false, message: "This clip is already being processed." };
 
-  await createAdminClient().from("clips").update({ status: "uploaded", error: null }).eq("id", clipId);
-  await queueJob(clipId, "prescan", member.id);
+  const admin = createAdminClient();
+  const { data: sent } = await admin.from("rallies").select("id").eq("clip_id", clipId).in("status", ["queued", "analysing", "failed"]);
+  if (clip.status === "failed" && sent?.length) {
+    await admin.from("rallies").update({ status: "queued" }).in("id", sent.map((r) => r.id));
+    await admin.from("clips").update({ status: "queued", error: null }).eq("id", clipId);
+    await queueJob(clipId, "analyse", member.id);
+  } else {
+    await admin.from("clips").update({ status: "uploaded", error: null }).eq("id", clipId);
+    await queueJob(clipId, "prescan", member.id);
+  }
   revalidatePath("/");
   return { ok: true };
 }
@@ -177,7 +186,7 @@ export async function deleteClip(clipId: string): Promise<Result> {
 
   // Rally files are keyed by rally id; the rows go with the clip (on delete cascade).
   const { data: rallies } = await supabase.from("rallies").select("id").eq("clip_id", clipId);
-  const rallyKeys = (rallies ?? []).flatMap((r) => [`thumbs/${r.id}.jpg`, `pose/${r.id}.npz`, `shuttle/${r.id}.npz`]);
+  const rallyKeys = (rallies ?? []).flatMap((r) => [`thumbs/${r.id}.jpg`, `pose/${r.id}.npz`, `shuttle/${r.id}.npz`, `overlay/${r.id}.json`]);
 
   try {
     const mp4 = clipKeys(clipId, "mp4");

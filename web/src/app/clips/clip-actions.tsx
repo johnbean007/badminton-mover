@@ -4,12 +4,19 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState, useTransition } from "react";
 
-import { retryPrescan } from "./actions";
+import { retryClip } from "./actions";
 
-// Review link or Retry button on a library card.
+// Review or Watch link, or Retry button, on a library card.
 export function ClipNextStep({ clipId, status, canEdit }: { clipId: string; status: string; canEdit: boolean }) {
   const [pending, startTransition] = useTransition();
   const [message, setMessage] = useState<string | null>(null);
+  if (status === "ready") {
+    return (
+      <Link href={`/clips/${clipId}`} className="btn small primary">
+        Watch
+      </Link>
+    );
+  }
   if (status === "review") {
     return (
       <Link href={`/clips/${clipId}/review`} className="btn small primary">
@@ -26,7 +33,7 @@ export function ClipNextStep({ clipId, status, canEdit }: { clipId: string; stat
           disabled={pending}
           onClick={() =>
             startTransition(async () => {
-              const res = await retryPrescan(clipId);
+              const res = await retryClip(clipId);
               setMessage(res.ok ? null : res.message);
             })
           }

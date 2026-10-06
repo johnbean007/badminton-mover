@@ -19,6 +19,13 @@ detect = [
     "rtmlib",
     "onnxruntime",
 ]
+# Pose and shuttle tracking (only needed to run the analysis locally, see local_analyse.py).
+analyse = [
+    "rtmlib",
+    "onnxruntime",
+    "torch>=2.6",
+    "pillow",
+]
 
 [tool.uv]
 default-groups = ["pipeline"]

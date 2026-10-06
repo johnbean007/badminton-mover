@@ -198,3 +198,30 @@ textarea.input { resize: vertical; font: inherit; }
 .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .btn-grid .wide { grid-column: 1 / -1; }
 .swatch { width: 34px; height: 34px; border-radius: 8px; border: 1px solid var(--line); display: inline-block; }
+
+/* Viewer (milestone 4) */
+.link { text-decoration: underline; text-underline-offset: 2px; }
+.rally-tabs { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+.rally-tab { padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); white-space: nowrap; font-weight: 500; }
+.rally-tab:hover { background: var(--surface-2); }
+.rally-tab.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.rally-tab.off { opacity: .55; cursor: default; }
+.rally-tab.off:hover { background: var(--surface); }
+.viewer { display: flex; flex-direction: column; gap: 10px; }
+.viewer .stage { margin: 0 auto; }
+.viewer canvas.overlay { pointer-events: none; }
+.speeds { display: flex; gap: 4px; }
+.scrubber { width: 100%; accent-color: var(--accent); }
+.timeline { padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.lane { display: grid; grid-template-columns: 64px minmax(0, 1fr); align-items: center; gap: 8px; }
+.lane-track { position: relative; height: 26px; background: var(--surface-2); border-radius: 6px; }
+.lane-note { margin: 0; padding-left: 72px; }
+.hit { position: absolute; top: 50%; width: 11px; height: 11px; margin: -5.5px 0 0 -5.5px; transform: rotate(45deg); border: 2px solid var(--ink); border-radius: 1px; }
+.hit.player { background: var(--ink); }
+.playhead { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; background: var(--bad); pointer-events: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { display: inline-block; width: 14px; height: 4px; border-radius: 2px; }
+.legend i.ring { width: 11px; height: 11px; border-radius: 50%; border: 2px solid; background: none; }
+.legend i.diamond { width: 9px; height: 9px; transform: rotate(45deg); border: 2px solid var(--ink); border-radius: 1px; background: none; }
+.legend i.diamond.filled { background: var(--ink); }

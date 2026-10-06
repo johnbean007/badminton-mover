@@ -7,6 +7,12 @@ trigger call got lost.
     .venv/bin/modal deploy app.py               # publish (prints the trigger URL)
     .venv/bin/modal run app.py::hello           # GPU smoke test
     .venv/bin/modal run app.py::prescan_now --clip-id <uuid>   # pre-scan one clip by hand
+    .venv/bin/modal run app.py::gpu_check                      # pose and shuttle models load on the GPU
+    .venv/bin/modal run app.py::analyse_now --clip-id <uuid>   # (re-)analyse a clip's chosen rallies
+
+The shuttle tracker's checkpoints live in the Modal volume badminton-mover-models, put there once with
+    .venv/bin/modal volume put badminton-mover-models ../spike/vendor/TrackNetV3/ckpts/TrackNet_best.pt /tracknet/
+    .venv/bin/modal volume put badminton-mover-models ../spike/vendor/TrackNetV3/ckpts/InpaintNet_best.pt /tracknet/
 """
 from __future__ import annotations
 
@@ -38,6 +44,29 @@ detect_image = (
     .pip_install("rtmlib", "onnxruntime")
     .run_function(fetch_detector)
     .add_local_python_source("prescan", "store", "sidecheck")
+)
+
+
+# Pose (ONNX Runtime) and shuttle tracking (PyTorch) on the GPU. Torch's CUDA 13 wheels also
+# bring the CUDA and cuDNN libraries onnxruntime-gpu loads; rtmlib pulls in the CPU onnxruntime,
+# which is swapped for the GPU build.
+models = modal.Volume.from_name("badminton-mover-models", create_if_missing=True)
+TRACKNET_DIR = "/models/tracknet"
+
+
+def fetch_pose_models():
+    from rtmlib import Wholebody
+
+    Wholebody(mode="lightweight", backend="onnxruntime", device="cpu")
+
+
+gpu_image = (
+    base.apt_install("ffmpeg", "libgl1", "libglib2.0-0")
+    .pip_install("torch", index_url="https://download.pytorch.org/whl/cu130")
+    .pip_install("boto3", "httpx", "numpy>=2", "pillow", "rtmlib")
+    .run_commands("pip uninstall -y onnxruntime", "pip install onnxruntime-gpu")
+    .run_function(fetch_pose_models)
+    .add_local_python_source("store", "analyse", "tracknet", "tracknet_model")
 )
 
 
@@ -234,7 +263,155 @@ def sidecheck(job_id: str) -> None:
         store.update("jobs", {"status": "failed", "error": f"{type(e).__name__}: {e}"[:500], "finished_at": now()}, id=f"eq.{job_id}")
 
 
-RUNNERS = {"prescan": prescan, "sidecheck": sidecheck}
+# --- Analysis: pose, shuttle and hits ------------------------------------------------------------
+
+def gpu_models():
+    """The pose model on CUDA and the shuttle tracker, with the versions to record."""
+    import onnxruntime as ort
+    import torch
+
+    import analyse as an
+    from tracknet import UPSTREAM, ShuttleTracker
+
+    try:
+        ort.preload_dlls()  # CUDA and cuDNN from torch's wheels
+    except AttributeError:
+        pass
+    pose = an.PoseModel(device="cuda")
+    tracker = ShuttleTracker(TRACKNET_DIR)
+    versions = {"analyse": an.PIPELINE_VERSION, "pose": f"rtmlib {an.POSE_MODE}", "pose_device": pose.providers[0],
+                "onnxruntime": ort.__version__, "tracknet": UPSTREAM, "torch": torch.__version__, "shuttle_device": str(tracker.device)}
+    return pose, tracker, versions
+
+
+def analysis_copy(src: str, dst: str, fps: float, height: int, until_s: float) -> None:
+    """Full-resolution (up to 1080p) copy at the playback copy's frame rate, so frame numbers match it.
+    The 720p playback copy is too small for the far player's pose, which tells who hit the shuttle."""
+    import subprocess
+
+    scale = ",scale=-2:1080" if height > 1080 else ""
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", src, "-t", f"{until_s:.3f}", "-vf", f"fps={fps}{scale}", "-c:v", "libx264",
+         "-preset", "ultrafast", "-crf", "14", "-g", str(max(1, round(fps))), "-pix_fmt", "yuv420p", "-an", dst],
+        check=True,
+    )
+
+
+@app.function(image=gpu_image, secrets=secrets, gpu="T4", cpu=8, memory=16384, timeout=40 * 60, volumes={"/models": models})
+def analyse(job_id: str) -> None:
+    import datetime as dt
+    import os
+    import tempfile
+    import time
+    import traceback
+
+    import numpy as np
+
+    import analyse as an
+    import store
+
+    now = lambda: dt.datetime.now(dt.UTC).isoformat()  # noqa: E731
+    claimed = store.update("jobs", {"status": "running", "started_at": now(), "progress": 0.02}, id=f"eq.{job_id}", status="eq.queued")
+    if not claimed:
+        return
+    job = claimed[0]
+    store.update("jobs", {"attempts": job["attempts"] + 1}, id=f"eq.{job_id}")
+    clip_id = job["clip_id"]
+    last = [0.0]
+
+    def progress(p: float, force: bool = False):
+        if force or time.time() - last[0] > 5:
+            last[0] = time.time()
+            store.update("jobs", {"progress": round(min(p, 0.99), 3)}, id=f"eq.{job_id}")
+
+    try:
+        clips = store.select("clips", id=f"eq.{clip_id}", select="original_key,fps,height,shirt_colour,player_id")
+        if not clips:
+            store.update("jobs", {"status": "failed", "error": "Clip was deleted", "finished_at": now()}, id=f"eq.{job_id}")
+            return
+        clip = clips[0]
+        fps = float(clip["fps"])
+        rallies = store.select("rallies", clip_id=f"eq.{clip_id}", status="in.(queued,analysing)", calibration_id="not.is.null",
+                               select="id,start_frame,end_frame,calibration_id", order="start_frame")
+        if not rallies:
+            raise ValueError("No calibrated rallies waiting for analysis")
+        cals = {c["id"]: np.array(c["homography"], float) for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,homography")}
+        store.update("clips", {"status": "analysing", "error": None}, id=f"eq.{clip_id}")
+
+        pose, tracker, versions = gpu_models()
+        results, done = {}, 0
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "original" + os.path.splitext(clip["original_key"])[1])
+            store.download(clip["original_key"], src)
+            path = os.path.join(tmp, "analysis.mp4")
+            analysis_copy(src, path, fps, int(clip["height"] or 1080), (max(r["end_frame"] for r in rallies) + fps) / fps)
+            os.remove(src)
+            progress(0.1, force=True)
+
+            for i, r in enumerate(rallies):
+                rid = r["id"]
+                store.update("rallies", {"status": "analysing"}, id=f"eq.{rid}")
+                base_p, span = 0.1 + 0.9 * i / len(rallies), 0.9 / len(rallies)
+                try:
+                    res = an.analyse_rally(path, r["start_frame"], r["end_frame"], fps, cals[r["calibration_id"]],
+                                           clip["shirt_colour"], pose, tracker, lambda f: progress(base_p + span * f))
+                    keys = {"pose_key": f"pose/{rid}.npz", "shuttle_key": f"shuttle/{rid}.npz"}
+                    store.put_bytes(an.pose_npz(res, versions), keys["pose_key"], "application/octet-stream")
+                    store.put_bytes(an.shuttle_npz(res, versions), keys["shuttle_key"], "application/octet-stream")
+                    store.put_bytes(an.overlay_json(res), f"overlay/{rid}.json", "application/json")
+                    # A re-run replaces the tracker's hits; hits members added stay.
+                    store.remove("shuttle_hits", rally_id=f"eq.{rid}", source="eq.tracker")
+                    store.insert("shuttle_hits", [{"rally_id": rid, "frame": r["start_frame"] + h["index"], "hitter": h["hitter"],
+                                                   "confidence": h["confidence"]} for h in res.hits])
+                    store.remove("rally_subjects", rally_id=f"eq.{rid}")
+                    store.insert("rally_subjects", [{"rally_id": rid, "player_id": clip["player_id"], "side": "near"}])
+                    store.update("rallies", {**keys, "status": "ready"}, id=f"eq.{rid}")
+                    results[rid] = res.stats
+                    done += 1
+                except Exception as e:  # noqa: BLE001
+                    traceback.print_exc()
+                    store.update("rallies", {"status": "failed"}, id=f"eq.{rid}")
+                    results[rid] = {"error": f"{type(e).__name__}: {e}"[:300]}
+                progress(base_p + span, force=True)
+
+        if done:
+            store.update("clips", {"status": "ready", "error": None}, id=f"eq.{clip_id}")
+            store.update("jobs", {"status": "done", "progress": 1, "finished_at": now(), "error": None,
+                                  "versions": {**versions, "rallies": results}}, id=f"eq.{job_id}")
+        else:
+            raise RuntimeError("Every rally failed: " + "; ".join(v["error"] for v in results.values())[:400])
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        store.update("jobs", {"status": "failed", "error": f"{type(e).__name__}: {e}"[:500], "finished_at": now()}, id=f"eq.{job_id}")
+        store.update("rallies", {"status": "failed"}, clip_id=f"eq.{clip_id}", status="in.(queued,analysing)")
+        store.update("clips", {"status": "failed", "error": "Analysing the rallies failed. Retry, and if it fails again tell the admin."},
+                     id=f"eq.{clip_id}")
+
+
+@app.function(image=gpu_image, gpu="T4", timeout=600, volumes={"/models": models})
+def gpu_check() -> dict:
+    """Loads both models on the GPU and times them on blank frames."""
+    import time
+
+    import numpy as np
+
+    from tracknet import shrink
+
+    pose, tracker, versions = gpu_models()
+    frame = np.full((1008, 1920, 3), 90, np.uint8)
+    t = time.time()
+    for _ in range(20):
+        pose.keypoints(frame, np.float32([[800, 400, 1000, 900]]))
+    pose_fps = 20 / (time.time() - t)
+    small = np.stack([shrink(frame)] * 64)
+    t = time.time()
+    tracker.track(small, 1920, 1008)
+    result = {**versions, "pose_crops_per_s": round(pose_fps, 1), "shuttle_frames_per_s": round(64 / (time.time() - t), 1)}
+    print(result)
+    return result
+
+
+RUNNERS = {"prescan": prescan, "sidecheck": sidecheck, "analyse": analyse}
 
 
 # --- Starting jobs ------------------------------------------------------------------------------
@@ -279,7 +456,11 @@ def sweep() -> None:
             RUNNERS[job["type"]].spawn(job["id"])
     for job in store.select("jobs", status="eq.running", started_at=f"lt.{(now - dt.timedelta(minutes=45)).isoformat()}"):
         store.update("jobs", {"status": "failed", "error": "Timed out", "finished_at": now.isoformat()}, id=f"eq.{job['id']}")
-        store.update("clips", {"status": "failed", "error": "Finding the rallies took too long. Retry."}, id=f"eq.{job['clip_id']}")
+        if job["type"] == "prescan":
+            store.update("clips", {"status": "failed", "error": "Finding the rallies took too long. Retry."}, id=f"eq.{job['clip_id']}")
+        elif job["type"] in ("analyse", "reanalyse"):
+            store.update("rallies", {"status": "failed"}, clip_id=f"eq.{job['clip_id']}", status="in.(queued,analysing)")
+            store.update("clips", {"status": "failed", "error": "Analysing the rallies took too long. Retry."}, id=f"eq.{job['clip_id']}")
 
 
 @app.function(image=cpu_image, secrets=secrets)
@@ -299,6 +480,27 @@ def job_summary(job_id: str) -> dict:
     clip = store.select("clips", id=f"eq.{job['clip_id']}", select="status,error,fps,playback_key")[0]
     rallies = store.select("rallies", clip_id=f"eq.{job['clip_id']}", select="index,start_frame,end_frame", order="index")
     return {"job": {k: job[k] for k in ("status", "error", "versions", "started_at", "finished_at")}, "clip": clip, "rallies": rallies}
+
+
+@app.function(image=cpu_image, secrets=secrets)
+def requeue_analysis(clip_id: str) -> str:
+    """Puts a clip's analysed (or failed) rallies back in the queue and records an analyse job."""
+    import store
+
+    store.update("rallies", {"status": "queued"}, clip_id=f"eq.{clip_id}", status="in.(ready,failed,analysing)")
+    store.update("clips", {"status": "queued", "error": None}, id=f"eq.{clip_id}")
+    return queue_job.local(clip_id, "analyse")
+
+
+@app.local_entrypoint()
+def analyse_now(clip_id: str):
+    """Re-analyses one clip's rallies by hand, waiting for it to finish."""
+    job_id = requeue_analysis.remote(clip_id)
+    analyse.remote(job_id)
+    summary = job_summary.remote(job_id)
+    print({k: summary["job"][k] for k in ("status", "error")})
+    for rid, stats in (summary["job"]["versions"] or {}).get("rallies", {}).items():
+        print(rid[:8], stats)
 
 
 @app.local_entrypoint()

@@ -44,3 +44,5 @@ jobs:
       - run: uv sync --locked
       - name: Worker module imports
         run: uv run python -c "import app"
+      - name: Analysis helper tests
+        run: uv run python -m unittest test_analyse

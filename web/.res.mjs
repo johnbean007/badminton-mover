@@ -1,0 +1,11 @@
+import { createClient } from "@supabase/supabase-js";
+const db = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.SUPABASE_SECRET_KEY, { auth: { persistSession: false } });
+const id = "5d6d4ffd-38ac-4877-82be-cea98cb9a9fa";
+const { data: j } = await db.from("jobs").select("versions,started_at,finished_at,error").eq("clip_id", id).eq("type", "analyse").order("created_at", { ascending: false }).limit(1).single();
+const { rallies: rs, ...v } = j.versions ?? {};
+console.log(JSON.stringify(v), j.started_at.slice(11,19), j.finished_at?.slice(11,19), j.error ?? "");
+const { data: r } = await db.from("rallies").select("id,index,start_frame,end_frame,status,pose_key").eq("clip_id", id).order("index");
+for (const x of r) console.log(x.index, x.id.slice(0,8), x.start_frame, x.end_frame, x.status, JSON.stringify(rs?.[x.id] ?? {}));
+const { count: hc } = await db.from("shuttle_hits").select("id", { count: "exact", head: true }).in("rally_id", r.map((x) => x.id));
+const { count: sc } = await db.from("rally_subjects").select("id", { count: "exact", head: true }).in("rally_id", r.map((x) => x.id));
+console.log("shuttle_hits", hc, "rally_subjects", sc);

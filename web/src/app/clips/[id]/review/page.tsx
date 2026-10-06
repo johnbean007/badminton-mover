@@ -49,9 +49,10 @@ export default async function ReviewPage({ params }: PageProps<"/clips/[id]/revi
     );
   }
 
-  const [{ data: rallies }, { data: calibrations }] = await Promise.all([
+  const [{ data: rallies }, { data: calibrations }, { data: sideJobs }] = await Promise.all([
     supabase.from("rallies").select("id, start_frame, end_frame, included, thumb_key, calibration_id, near_side").eq("clip_id", id).order("start_frame"),
     supabase.from("calibrations").select("id, corners, frame").eq("clip_id", id).order("created_at"),
+    supabase.from("jobs").select("status, progress").eq("clip_id", id).eq("type", "sidecheck").order("created_at", { ascending: false }).limit(1),
   ]);
 
   const thumbKeys = [...new Set((rallies ?? []).map((r) => r.thumb_key).filter(Boolean) as string[])];
@@ -82,6 +83,7 @@ export default async function ReviewPage({ params }: PageProps<"/clips/[id]/revi
           thumbUrls={thumbUrls}
           calibrations={(calibrations ?? []).map((c) => ({ id: c.id, corners: c.corners as Pt[], frame: c.frame ?? 0 }))}
           initialShirt={clip.shirt_colour}
+          sideCheck={sideJobs?.[0] ? { status: sideJobs[0].status, progress: Number(sideJobs[0].progress) } : null}
         />
       </main>
     </>

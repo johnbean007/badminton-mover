@@ -14,6 +14,11 @@ pipeline = [
     "opencv-python-headless>=4.10",
     "scenedetect>=0.6.6",
 ]
+# The near-side check's person detector (heavier; only needed to run sidecheck locally).
+detect = [
+    "rtmlib",
+    "onnxruntime",
+]
 
 [tool.uv]
 default-groups = ["pipeline"]

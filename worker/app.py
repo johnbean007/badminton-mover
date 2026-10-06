@@ -18,11 +18,26 @@ PRESCAN_VERSION = "1"
 
 secrets = [modal.Secret.from_name("badminton-mover-r2"), modal.Secret.from_name("badminton-mover-supabase")]
 
+YOLOX_M = "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_m_8xb8-300e_humanart-c2c7a14a.zip"
+
+
+def fetch_detector():
+    from rtmlib import YOLOX
+
+    YOLOX(YOLOX_M, model_input_size=(640, 640), backend="onnxruntime", device="cpu")
+
+
 base = modal.Image.debian_slim(python_version="3.12")
-cpu_image = (
-    base.apt_install("ffmpeg")
-    .pip_install("boto3", "httpx", "numpy>=2", "opencv-python-headless>=4.10", "scenedetect>=0.6.6", "fastapi[standard]")
-    .add_local_python_source("prescan", "store")
+cpu_deps = base.apt_install("ffmpeg").pip_install(
+    "boto3", "httpx", "numpy>=2", "opencv-python-headless>=4.10", "scenedetect>=0.6.6", "fastapi[standard]"
+)
+cpu_image = cpu_deps.add_local_python_source("prescan", "store")
+# Person detector for the near-side check, baked into the image so jobs don't download it.
+detect_image = (
+    cpu_deps.apt_install("libgl1", "libglib2.0-0")
+    .pip_install("rtmlib", "onnxruntime")
+    .run_function(fetch_detector)
+    .add_local_python_source("prescan", "store", "sidecheck")
 )
 
 
@@ -169,7 +184,57 @@ def prescan(job_id: str) -> None:
         store.update("clips", {"status": "failed", "error": friendly(e)}, id=f"eq.{clip_id}")
 
 
-RUNNERS = {"prescan": prescan}
+# --- Near-side check -----------------------------------------------------------------------------
+
+@app.function(image=detect_image, secrets=secrets, cpu=4, memory=4096, timeout=20 * 60)
+def sidecheck(job_id: str) -> None:
+    import datetime as dt
+    import os
+    import tempfile
+    import traceback
+
+    import numpy as np
+    from rtmlib import YOLOX
+
+    import sidecheck as sc
+    import store
+
+    now = lambda: dt.datetime.now(dt.UTC).isoformat()  # noqa: E731
+    claimed = store.update("jobs", {"status": "running", "started_at": now(), "progress": 0.05}, id=f"eq.{job_id}", status="eq.queued")
+    if not claimed:
+        return
+    job = claimed[0]
+    store.update("jobs", {"attempts": job["attempts"] + 1}, id=f"eq.{job_id}")
+    clip_id = job["clip_id"]
+    try:
+        clip = store.select("clips", id=f"eq.{clip_id}", select="playback_key,shirt_colour")[0]
+        if not clip["shirt_colour"] or not clip["playback_key"]:
+            raise ValueError("No shirt colour or playback copy yet")
+        rallies = store.select("rallies", clip_id=f"eq.{clip_id}", included="eq.true", calibration_id="not.is.null",
+                               select="id,start_frame,end_frame,calibration_id", order="start_frame")
+        cals = {c["id"]: np.array(c["homography"], float) for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,homography")}
+        shirt = sc.lab(clip["shirt_colour"])
+        detector = YOLOX(YOLOX_M, model_input_size=(640, 640), backend="onnxruntime", device="cpu")
+        detect = lambda frame: detector(frame)  # noqa: E731
+
+        results = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "playback.mp4")
+            store.download(clip["playback_key"], path)
+            for i, r in enumerate(rallies):
+                frames = sc.sample_frames(path, r["start_frame"], r["end_frame"])
+                side, votes = sc.check_segment(frames, detect, cals[r["calibration_id"]], shirt)
+                store.update("rallies", {"near_side": side}, id=f"eq.{r['id']}")
+                results[r["id"]] = votes
+                store.update("jobs", {"progress": 0.1 + 0.9 * (i + 1) / max(1, len(rallies))}, id=f"eq.{job_id}")
+        store.update("jobs", {"status": "done", "progress": 1, "finished_at": now(), "error": None,
+                              "versions": {"sidecheck": "1", "detector": "yolox_m_humanart", "votes": results}}, id=f"eq.{job_id}")
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        store.update("jobs", {"status": "failed", "error": f"{type(e).__name__}: {e}"[:500], "finished_at": now()}, id=f"eq.{job_id}")
+
+
+RUNNERS = {"prescan": prescan, "sidecheck": sidecheck}
 
 
 # --- Starting jobs ------------------------------------------------------------------------------

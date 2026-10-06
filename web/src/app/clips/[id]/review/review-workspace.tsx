@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { CORNER_NAMES, COURT_LINES, checkCorners, courtToFrame, NET_LINE, project, type Pt } from "@/lib/court";
 
-import { type Segment, saveCalibration, saveSegments, saveShirtColour, startAnalysis } from "./actions";
+import { runSideCheck, type Segment, saveCalibration, saveSegments, saveShirtColour, startAnalysis } from "./actions";
 
 type Calibration = { id: string; corners: Pt[]; frame: number };
 type Mode = "view" | "corners" | "shirt";
@@ -20,6 +20,7 @@ type Props = {
   thumbUrls: Record<string, string>;
   calibrations: Calibration[];
   initialShirt: string | null;
+  sideCheck: { status: string; progress: number } | null;
 };
 
 const MIN_SEGMENT_FRAMES = 15;
@@ -37,6 +38,9 @@ export function ReviewWorkspace(props: Props) {
   const stopAt = useRef<number | null>(null);
   const dragging = useRef<number | null>(null);
 
+  // Refreshes re-sign the links; keep the first ones so the video and thumbnails don't reload.
+  const [videoUrl] = useState(props.videoUrl);
+  const [thumbUrls] = useState(props.thumbUrls);
   const [segments, setSegments] = useState(props.initialSegments);
   const [selected, setSelected] = useState<number | null>(props.initialSegments.length ? 0 : null);
   const [frame, setFrame] = useState(0);
@@ -58,6 +62,21 @@ export function ReviewWorkspace(props: Props) {
   const H = shownCorners.length === 4 ? courtToFrame(shownCorners) : null;
   const kept = segments.filter((s) => s.included && props.nearSide[s.id ?? ""] !== "far");
   const allCalibrated = kept.length > 0 && kept.every((s) => s.calibrationId);
+
+  // While the worker checks sides, refresh the server data (segment badges) every few seconds.
+  const checking = props.sideCheck?.status === "queued" || props.sideCheck?.status === "running";
+  useEffect(() => {
+    if (!checking) return;
+    const t = setInterval(() => router.refresh(), 4000);
+    return () => clearInterval(t);
+  }, [checking, router]);
+
+  async function checkSides() {
+    setMessage(null);
+    const res = await runSideCheck(clipId);
+    if (!res.ok) setMessage({ tone: "bad", text: res.message });
+    router.refresh();
+  }
 
   // Follow the playhead smoothly while playing, and stop at the end of a segment being previewed.
   useEffect(() => {
@@ -238,6 +257,7 @@ export function ReviewWorkspace(props: Props) {
     setSegments(segments.map((s) => (!onlyThis || s.id === seg?.id ? { ...s, calibrationId: res.calibrationId } : s)));
     setMode("view");
     setMessage({ tone: "good", text: onlyThis ? "Calibration saved for this segment." : "Calibration saved for every segment." });
+    router.refresh();
   }
 
   async function keepShirt() {
@@ -249,6 +269,7 @@ export function ReviewWorkspace(props: Props) {
     setShirt(sample);
     setSample(null);
     setMode("view");
+    router.refresh();
   }
 
   async function analyse() {
@@ -271,7 +292,7 @@ export function ReviewWorkspace(props: Props) {
         <div className={`stage mode-${mode}`} style={{ aspectRatio: aspect }}>
           <video
             ref={video}
-            src={props.videoUrl}
+            src={videoUrl}
             crossOrigin="anonymous"
             preload="auto"
             playsInline
@@ -393,7 +414,7 @@ export function ReviewWorkspace(props: Props) {
         <ol className="segments" aria-label="Proposed rally segments">
           {segments.map((s, i) => {
             const side = s.id ? props.nearSide[s.id] : null;
-            const thumb = s.thumbKey ? props.thumbUrls[s.thumbKey] : null;
+            const thumb = s.thumbKey ? thumbUrls[s.thumbKey] : null;
             return (
               <li key={s.id ?? `new-${i}`}>
                 <button
@@ -412,7 +433,15 @@ export function ReviewWorkspace(props: Props) {
                     <span className="mono small">
                       {clock(s.start, fps)} · {((s.end - s.start + 1) / fps).toFixed(1)} s
                     </span>
-                    {!s.included ? <span className="pill small">Removed</span> : side === "far" ? <span className="pill warn small">Player on far side</span> : null}
+                    {!s.included ? (
+                      <span className="pill small">Removed</span>
+                    ) : side === "far" ? (
+                      <span className="pill warn small">Player on far side</span>
+                    ) : side === "near" ? (
+                      <span className="pill good small">Near side</span>
+                    ) : side === "unclear" ? (
+                      <span className="pill small">Side unclear</span>
+                    ) : null}
                   </span>
                 </button>
               </li>
@@ -532,13 +561,33 @@ export function ReviewWorkspace(props: Props) {
           ) : null}
         </section>
 
+        <section className="panel pad stack">
+          <h2 className="side-title">
+            4 · Near-side check {props.sideCheck?.status === "done" ? <span className="pill good small">Done</span> : null}
+          </h2>
+          <p className="muted small">
+            {checking
+              ? `Checking which side the player is on… ${Math.round((props.sideCheck?.progress ?? 0) * 100)}%`
+              : props.sideCheck?.status === "failed"
+                ? "The check failed. Try again."
+                : props.sideCheck?.status === "done"
+                  ? "Segments with the player on the far side are skipped. “Side unclear” segments are kept."
+                  : "Runs by itself once the court and shirt colour are set."}
+          </p>
+          {canEdit && shirt && allCalibrated && !checking ? (
+            <button type="button" className="btn small" disabled={busy} onClick={checkSides}>
+              Check again
+            </button>
+          ) : null}
+        </section>
+
         {canEdit ? (
           <section className="panel pad stack">
-            <h2 className="side-title">4 · Analyse</h2>
+            <h2 className="side-title">5 · Analyse</h2>
             <p className="muted small">
               {kept.length} segment{kept.length === 1 ? "" : "s"} will be analysed for footwork and shuttle.
             </p>
-            <button type="button" className="btn primary" disabled={busy || !shirt || !allCalibrated || kept.length === 0} onClick={analyse}>
+            <button type="button" className="btn primary" disabled={busy || checking || !shirt || !allCalibrated || kept.length === 0} onClick={analyse}>
               {starting ? "Starting…" : "Analyse"}
             </button>
           </section>

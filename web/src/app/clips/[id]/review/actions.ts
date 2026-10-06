@@ -95,6 +95,8 @@ export async function saveCalibration(clipId: string, corners: Pt[], frame: numb
   if (onlySegmentId) q = q.eq("id", onlySegmentId);
   const { error: linkError } = await q;
   if (linkError) return { ok: false, message: "Saved the calibration but couldn't apply it. Try again." };
+  // The near-side check uses the court, so it reruns whenever the court changes.
+  if (ctx.clip.shirt_colour) await queueJob(clipId, "sidecheck", ctx.member.id);
   return { ok: true, calibrationId: cal.id };
 }
 
@@ -104,6 +106,21 @@ export async function saveShirtColour(clipId: string, hex: string): Promise<Resu
   if (!/^#[0-9a-f]{6}$/i.test(hex)) return { ok: false, message: "That isn't a colour." };
   const { error } = await ctx.supabase.from("clips").update({ shirt_colour: hex.toLowerCase() }).eq("id", clipId);
   if (error) return { ok: false, message: "Couldn't save the shirt colour. Try again." };
+  await runSideCheck(clipId);
+  return { ok: true };
+}
+
+// Works out, per segment, whether the tracked player is on the near side (needs the court and the
+// shirt colour). Runs on the worker; the review page refreshes until it's done.
+export async function runSideCheck(clipId: string): Promise<Result> {
+  const ctx = await editableClip(clipId);
+  if ("error" in ctx) return { ok: false, message: ctx.error! };
+  const { data: clip } = await ctx.supabase.from("clips").select("shirt_colour").eq("id", clipId).single();
+  if (!clip?.shirt_colour) return { ok: false, message: "Pick the shirt colour first." };
+  const { count } = await ctx.supabase.from("rallies").select("id", { count: "exact", head: true }).eq("clip_id", clipId).not("calibration_id", "is", null);
+  if (!count) return { ok: false, message: "Calibrate the court first." };
+  await queueJob(clipId, "sidecheck", ctx.member.id);
+  revalidatePath(`/clips/${clipId}/review`);
   return { ok: true };
 }
 

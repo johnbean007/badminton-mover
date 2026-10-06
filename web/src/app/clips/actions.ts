@@ -7,6 +7,7 @@ import { clipKeys, DISCIPLINES, MAX_BYTES, MAX_SECONDS, ROUNDS, SINGLES, VIDEO_T
 import { deleteObjects, objectSize, signUpload } from "@/lib/r2";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
+import { queueJob } from "@/lib/worker";
 
 type Result<T = object> = ({ ok: true } & T) | { ok: false, message: string };
 
@@ -140,12 +141,33 @@ export async function finishUpload(clipId: string, formData: FormData): Promise<
     return { ok: false, message: "Couldn't save the clip details. Try again." };
   }
 
+  try {
+    await queueJob(clipId, "prescan", member.id);
+  } catch (e) {
+    // The clip is saved; the admin can start the pre-scan with Retry.
+    console.error("queueing prescan failed", e);
+  }
+  revalidatePath("/");
+  return { ok: true };
+}
+
+// Starts the pre-scan again for a clip that failed (or never started).
+export async function retryPrescan(clipId: string): Promise<Result> {
+  const member = await requireMember();
+  const supabase = await createClient();
+  const { data: clip } = await supabase.from("clips").select("id, owner_id, status").eq("id", clipId).maybeSingle();
+  if (!clip) return { ok: false, message: "That clip has gone." };
+  if (clip.owner_id !== member.id && member.role !== "admin") return { ok: false, message: "Only the uploader or the admin can retry this clip." };
+  if (!["failed", "uploaded"].includes(clip.status)) return { ok: false, message: "This clip is already being processed." };
+
+  await createAdminClient().from("clips").update({ status: "uploaded", error: null }).eq("id", clipId);
+  await queueJob(clipId, "prescan", member.id);
   revalidatePath("/");
   return { ok: true };
 }
 
 // Deletes the clip's files from R2, then the clip. Only its uploader or the admin may.
-// Later milestones add rally thumbnails, pose and shuttle files here; training/ snippets are kept.
+// training/ snippets are kept.
 export async function deleteClip(clipId: string): Promise<Result> {
   const member = await requireMember();
   const supabase = await createClient();
@@ -153,9 +175,13 @@ export async function deleteClip(clipId: string): Promise<Result> {
   if (!clip) return { ok: false, message: "That clip has already gone." };
   if (clip.owner_id !== member.id && member.role !== "admin") return { ok: false, message: "Only the uploader or the admin can delete this clip." };
 
+  // Rally files are keyed by rally id; the rows go with the clip (on delete cascade).
+  const { data: rallies } = await supabase.from("rallies").select("id").eq("clip_id", clipId);
+  const rallyKeys = (rallies ?? []).flatMap((r) => [`thumbs/${r.id}.jpg`, `pose/${r.id}.npz`, `shuttle/${r.id}.npz`]);
+
   try {
     const mp4 = clipKeys(clipId, "mp4");
-    await deleteObjects([mp4.original, clipKeys(clipId, "mov").original, mp4.playback, mp4.thumb]);
+    await deleteObjects([mp4.original, clipKeys(clipId, "mov").original, mp4.playback, mp4.thumb, ...rallyKeys]);
   } catch (e) {
     console.error("deleteClip R2 failed", e);
     return { ok: false, message: "Couldn't delete the video files. Try again." };

@@ -6,7 +6,10 @@ import { type ClipStatus, DISCIPLINES, formatDuration, LOW_FPS, STATUS_LABELS } 
 import { signDownload } from "@/lib/r2";
 import { createClient } from "@/lib/supabase/server";
 
+import { AutoRefresh, ClipNextStep } from "./clips/clip-actions";
 import { DeleteClipButton } from "./clips/delete-clip-button";
+
+const PROCESSING = ["uploaded", "prescanning", "queued", "analysing"];
 
 const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v) ?? "";
 const uuid = /^[0-9a-f-]{36}$/i;
@@ -58,6 +61,12 @@ export default async function LibraryPage({ searchParams }: PageProps<"/">) {
   );
   const filtered = Boolean(filters.player || filters.opponent || filters.tournament || filters.discipline);
   const uploaded = one(params.uploaded) === "1";
+  const analysing = one(params.analysing) === "1";
+  const { data: rallyCounts } = cards.length
+    ? await supabase.from("rallies").select("clip_id").in("clip_id", cards.map((c) => c.id)).eq("included", true)
+    : { data: [] };
+  const ralliesByClip = new Map<string, number>();
+  for (const r of rallyCounts ?? []) ralliesByClip.set(r.clip_id, (ralliesByClip.get(r.clip_id) ?? 0) + 1);
 
   return (
     <>
@@ -73,7 +82,9 @@ export default async function LibraryPage({ searchParams }: PageProps<"/">) {
           </Link>
         </div>
 
-        {uploaded ? <p className="notice good">Clip uploaded. It&apos;s waiting for the pre-scan, which will find the rallies.</p> : null}
+        <AutoRefresh active={cards.some((c) => PROCESSING.includes(c.status))} />
+        {uploaded ? <p className="notice good">Clip uploaded. The pre-scan is finding the rallies; this usually takes a minute or two, and you can leave the page.</p> : null}
+        {analysing ? <p className="notice good">Analysis queued. The clip will show Ready when its footwork has been tracked.</p> : null}
 
         <form className="panel pad filters" method="get">
           <label className="field">
@@ -170,7 +181,7 @@ export default async function LibraryPage({ searchParams }: PageProps<"/">) {
                     <dl className="stats mono small">
                       <div>
                         <dt>Rallies</dt>
-                        <dd>–</dd>
+                        <dd>{ralliesByClip.get(c.id) ?? "–"}</dd>
                       </div>
                       <div>
                         <dt>Steps</dt>
@@ -182,7 +193,8 @@ export default async function LibraryPage({ searchParams }: PageProps<"/">) {
                       </div>
                     </dl>
                     <div className="row">
-                      <span className={`pill ${status === "ready" ? "good" : status === "failed" || status === "uploading" ? "bad" : ""}`}>{STATUS_LABELS[status] ?? status}</span>
+                      <ClipNextStep clipId={c.id} status={status} canEdit={canDelete} />
+                      <span className={`pill ${status === "ready" || status === "review" ? "good" : status === "failed" || status === "uploading" ? "bad" : ""}`}>{STATUS_LABELS[status] ?? status}</span>
                       {fps !== null && fps < LOW_FPS ? <span className="pill warn">Lower timing accuracy</span> : null}
                     </div>
                     {status === "failed" && c.error ? <p className="small bad-text">{c.error}</p> : null}

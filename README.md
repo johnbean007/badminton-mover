@@ -7,7 +7,10 @@ Tracks professional badminton players' footwork from broadcast clips and shows e
 
 ## Status
 
-Milestone 1 (foundations) done: invite-only sign-in, Vercel deploy, private R2 video bucket, Modal GPU worker skeleton, CI.
+- Milestone 1 (foundations): invite-only sign-in, Vercel deploy, private R2 video bucket, Modal worker, CI. Done.
+- Milestone 2 (upload and library): direct upload to R2, clip details, filters, delete. Done.
+- Milestone 3 (pre-scan and rally review): playback copy, camera-cut rally proposals, segment review, court calibration, shirt colour, near-side check. Done; a 5-minute London 2012 broadcast clip gave 11 correct segments with no fixes.
+- Next: milestone 4, pose and shuttle tracking on the GPU worker, and the viewer.
 
 ## Layout
 

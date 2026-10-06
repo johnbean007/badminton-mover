@@ -7,7 +7,14 @@ Tracks professional badminton players' footwork from broadcast clips and shows e
 
 ## Status
 
-Spike: checking that pose tracking finds the near-side player's feet well enough in real broadcast footage. See [spike/README.md](spike/README.md).
+Milestone 1 (foundations) done: invite-only sign-in, Vercel deploy, private R2 video bucket, Modal GPU worker skeleton, CI.
+
+## Layout
+
+- `web/`: Next.js app (Vercel). Copy `web/.env.example` to `web/.env.local`.
+- `worker/`: GPU worker on Modal. `cd worker && uv sync && .venv/bin/modal run app.py`
+- `supabase/`: database migrations.
+- `spike/`: the pose and shuttle tracking experiments. See [spike/README.md](spike/README.md).
 
 ## Rules for this repo
 

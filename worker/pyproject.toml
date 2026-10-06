@@ -1,0 +1,8 @@
+[project]
+name = "badminton-mover-worker"
+version = "0.1.0"
+description = "GPU worker: pose and shuttle tracking for Badminton Mover, run on Modal"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "modal>=1.0",
+]

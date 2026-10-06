@@ -38,13 +38,13 @@ base = modal.Image.debian_slim(python_version="3.12")
 cpu_deps = base.apt_install("ffmpeg").pip_install(
     "boto3", "httpx", "numpy>=2", "opencv-python-headless>=4.10", "scenedetect>=0.6.6", "fastapi[standard]"
 )
-cpu_image = cpu_deps.add_local_python_source("prescan", "store", "contacts")
+cpu_image = cpu_deps.add_local_python_source("prescan", "store", "contacts", "courtfit")
 # Person detector for the near-side check, baked into the image so jobs don't download it.
 detect_image = (
     cpu_deps.apt_install("libgl1", "libglib2.0-0")
     .pip_install("rtmlib", "onnxruntime")
     .run_function(fetch_detector)
-    .add_local_python_source("prescan", "store", "sidecheck")
+    .add_local_python_source("prescan", "store", "sidecheck", "courtfit")
 )
 
 
@@ -67,7 +67,7 @@ gpu_image = (
     .pip_install("boto3", "httpx", "numpy>=2", "pillow", "rtmlib")
     .run_commands("pip uninstall -y onnxruntime", "pip install onnxruntime-gpu")
     .run_function(fetch_pose_models)
-    .add_local_python_source("store", "analyse", "tracknet", "tracknet_model", "contacts")
+    .add_local_python_source("store", "analyse", "tracknet", "tracknet_model", "contacts", "courtfit")
 )
 
 
@@ -226,6 +226,7 @@ def sidecheck(job_id: str) -> None:
     import numpy as np
     from rtmlib import YOLOX
 
+    import courtfit as cf
     import sidecheck as sc
     import store
 
@@ -238,13 +239,14 @@ def sidecheck(job_id: str) -> None:
     clip_id = job["clip_id"]
     try:
         clip = store.select("clips", id=f"eq.{clip_id}", select="playback_key,shirt_colour")[0]
-        if not clip["shirt_colour"] or not clip["playback_key"]:
-            raise ValueError("No shirt colour or playback copy yet")
+        if not clip["playback_key"]:
+            raise ValueError("No playback copy yet")
         rallies = store.select("rallies", clip_id=f"eq.{clip_id}", included="eq.true", calibration_id="not.is.null",
                                select="id,start_frame,end_frame,calibration_id", order="start_frame")
         cals = {c["id"]: np.array(c["homography"], float) for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,homography")}
-        shirt = sc.lab(clip["shirt_colour"])
-        detector = YOLOX(YOLOX_M, model_input_size=(640, 640), backend="onnxruntime", device="cpu")
+        # The court fit needs only the calibration; the side check also needs the shirt colour.
+        shirt = sc.lab(clip["shirt_colour"]) if clip["shirt_colour"] else None
+        detector = YOLOX(YOLOX_M, model_input_size=(640, 640), backend="onnxruntime", device="cpu") if shirt is not None else None
         detect = lambda frame: detector(frame)  # noqa: E731
 
         results = {}
@@ -252,10 +254,13 @@ def sidecheck(job_id: str) -> None:
             path = os.path.join(tmp, "playback.mp4")
             store.download(clip["playback_key"], path)
             for i, r in enumerate(rallies):
-                frames = sc.sample_frames(path, r["start_frame"], r["end_frame"])
-                side, votes = sc.check_segment(frames, detect, cals[r["calibration_id"]], shirt)
-                store.update("rallies", {"near_side": side}, id=f"eq.{r['id']}")
-                results[r["id"]] = votes
+                H = cals[r["calibration_id"]]
+                values = {"court_fit": cf.rally_fit(path, r["start_frame"], r["end_frame"], H)}
+                if shirt is not None:
+                    side, votes = sc.check_segment(sc.sample_frames(path, r["start_frame"], r["end_frame"]), detect, H, shirt)
+                    values["near_side"] = side
+                    results[r["id"]] = votes
+                store.update("rallies", values, id=f"eq.{r['id']}")
                 store.update("jobs", {"progress": 0.1 + 0.9 * (i + 1) / max(1, len(rallies))}, id=f"eq.{job_id}")
         store.update("jobs", {"status": "done", "progress": 1, "finished_at": now(), "error": None,
                               "versions": {"sidecheck": "1", "detector": "yolox_m_humanart", "votes": results}}, id=f"eq.{job_id}")
@@ -335,6 +340,7 @@ def analyse(job_id: str) -> None:
     import numpy as np
 
     import analyse as an
+    import courtfit as cf
     import store
 
     now = lambda: dt.datetime.now(dt.UTC).isoformat()  # noqa: E731
@@ -394,7 +400,8 @@ def analyse(job_id: str) -> None:
                                                    "confidence": h["confidence"]} for h in res.hits])
                     stats = res.stats
                     stats["contacts"] = save_contacts(rid, clip["player_id"], pose_bytes, cals[r["calibration_id"]], hand)
-                    store.update("rallies", {**keys, "status": "ready"}, id=f"eq.{rid}")
+                    court_fit = cf.rally_fit(path, r["start_frame"], r["end_frame"], cals[r["calibration_id"]])
+                    store.update("rallies", {**keys, "status": "ready", "court_fit": court_fit}, id=f"eq.{rid}")
                     results[rid] = stats
                     done += 1
                 except Exception as e:  # noqa: BLE001
@@ -417,16 +424,20 @@ def analyse(job_id: str) -> None:
                      id=f"eq.{clip_id}")
 
 
-@app.function(image=cpu_image, secrets=secrets, timeout=15 * 60)
+@app.function(image=cpu_image, secrets=secrets, cpu=2, memory=4096, timeout=15 * 60)
 def reanalyse(job_id: str) -> None:
-    """Re-runs the later stages (contacts and zones for now) from the stored pose files: seconds on a
-    CPU instead of tracking the pose again. The clip stays viewable throughout."""
+    """Re-runs the later stages from the stored pose files: the court fit (after a recalibration),
+    then contacts and zones. Seconds on a CPU instead of tracking the pose again; the clip stays
+    viewable throughout."""
     import datetime as dt
+    import os
+    import tempfile
     import traceback
 
     import numpy as np
 
     import contacts as ct
+    import courtfit as cf
     import store
 
     now = lambda: dt.datetime.now(dt.UTC).isoformat()  # noqa: E731
@@ -437,17 +448,23 @@ def reanalyse(job_id: str) -> None:
     store.update("jobs", {"attempts": job["attempts"] + 1}, id=f"eq.{job_id}")
     clip_id = job["clip_id"]
     try:
-        clip = store.select("clips", id=f"eq.{clip_id}", select="player_id,player:players!clips_player_id_fkey(handedness)")[0]
+        clip = store.select("clips", id=f"eq.{clip_id}", select="playback_key,player_id,player:players!clips_player_id_fkey(handedness)")[0]
         hand = (clip.get("player") or {}).get("handedness")
         rallies = store.select("rallies", clip_id=f"eq.{clip_id}", status="eq.ready", pose_key="not.is.null",
-                               select="id,pose_key,calibration_id", order="start_frame")
+                               select="id,start_frame,end_frame,pose_key,calibration_id", order="start_frame")
         cals = {c["id"]: np.array(c["homography"], float) for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,homography")}
         results = {}
-        for i, r in enumerate(rallies):
-            results[r["id"]] = save_contacts(r["id"], clip["player_id"], store.get_bytes(r["pose_key"]), cals[r["calibration_id"]], hand)
-            store.update("jobs", {"progress": round(0.05 + 0.95 * (i + 1) / len(rallies), 3)}, id=f"eq.{job_id}")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "playback.mp4")
+            store.download(clip["playback_key"], path)
+            for i, r in enumerate(rallies):
+                H = cals[r["calibration_id"]]
+                fit = cf.rally_fit(path, r["start_frame"], r["end_frame"], H)
+                store.update("rallies", {"court_fit": fit}, id=f"eq.{r['id']}")
+                results[r["id"]] = {"court_fit": fit, **save_contacts(r["id"], clip["player_id"], store.get_bytes(r["pose_key"]), H, hand)}
+                store.update("jobs", {"progress": round(0.05 + 0.95 * (i + 1) / len(rallies), 3)}, id=f"eq.{job_id}")
         store.update("jobs", {"status": "done", "progress": 1, "finished_at": now(), "error": None,
-                              "versions": {"contacts": ct.RULES_VERSION, "rallies": results}}, id=f"eq.{job_id}")
+                              "versions": {"contacts": ct.RULES_VERSION, "court_fit_ok": cf.FIT_OK, "rallies": results}}, id=f"eq.{job_id}")
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         store.update("jobs", {"status": "failed", "error": f"{type(e).__name__}: {e}"[:500], "finished_at": now()}, id=f"eq.{job_id}")

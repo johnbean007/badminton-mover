@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
-import { CORNER_NAMES, COURT_LINES, checkCorners, courtToFrame, NET_LINE, project, type Pt } from "@/lib/court";
+import { CORNER_NAMES, COURT_FIT_OK, COURT_LINES, checkCorners, courtToFrame, NET_LINE, project, type Pt } from "@/lib/court";
 
 import { runSideCheck, type Segment, saveCalibration, saveSegments, saveShirtColour, startAnalysis } from "./actions";
 
@@ -17,6 +17,7 @@ type Props = {
   videoUrl: string;
   initialSegments: Segment[];
   nearSide: Record<string, "near" | "far" | "unclear" | null>;
+  courtFit: Record<string, number | null>;
   thumbUrls: Record<string, string>;
   calibrations: Calibration[];
   initialShirt: string | null;
@@ -62,6 +63,8 @@ export function ReviewWorkspace(props: Props) {
   const H = shownCorners.length === 4 ? courtToFrame(shownCorners) : null;
   const kept = segments.filter((s) => s.included && props.nearSide[s.id ?? ""] !== "far");
   const allCalibrated = kept.length > 0 && kept.every((s) => s.calibrationId);
+  const badFit = (s: Segment) => s.id !== null && props.courtFit[s.id] !== null && props.courtFit[s.id]! < COURT_FIT_OK;
+  const misfits = kept.filter(badFit).map((s) => segments.indexOf(s) + 1);
 
   // While the worker checks sides, refresh the server data (segment badges) every few seconds.
   const checking = props.sideCheck?.status === "queued" || props.sideCheck?.status === "running";
@@ -442,6 +445,7 @@ export function ReviewWorkspace(props: Props) {
                     ) : side === "unclear" ? (
                       <span className="pill small">Side unclear</span>
                     ) : null}
+                    {s.included && badFit(s) ? <span className="pill warn small">Court doesn&apos;t fit</span> : null}
                   </span>
                 </button>
               </li>
@@ -587,6 +591,12 @@ export function ReviewWorkspace(props: Props) {
             <p className="muted small">
               {kept.length} segment{kept.length === 1 ? "" : "s"} will be analysed for footwork and shuttle.
             </p>
+            {misfits.length ? (
+              <p className="notice warn">
+                The court lines don&apos;t match the camera view in segment{misfits.length === 1 ? "" : "s"} {misfits.join(", ")}: the camera zoomed or moved.
+                Select {misfits.length === 1 ? "it" : "each one"}, pause on a clear view and click the corners again in step 2 with &ldquo;Save for this segment&rdquo;, or court zones will be wrong.
+              </p>
+            ) : null}
             <button type="button" className="btn primary" disabled={busy || checking || !shirt || !allCalibrated || kept.length === 0} onClick={analyse}>
               {starting ? "Starting…" : "Analyse"}
             </button>

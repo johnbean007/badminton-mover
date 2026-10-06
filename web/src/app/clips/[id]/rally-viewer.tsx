@@ -1,8 +1,11 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { courtToFrame, type Mat3, project, type Pt } from "@/lib/court";
+import { CORNER_NAMES, COURT_FIT_OK, COURT_LINES, checkCorners, courtToFrame, type Mat3, NET_LINE, project, type Pt } from "@/lib/court";
+
+import { recalibrateRally } from "./actions";
 
 // overlay/{rally_id}.json, written by the worker: per frame from `start`, the tracked player's 23
 // keypoints as [x, y, confidence, …] (x, y in 1/10000ths of the frame, confidence in hundredths)
@@ -19,6 +22,11 @@ type Props = {
   hits: Hit[];
   contacts: Contact[];
   corners: Pt[] | null; // the court calibration (outer corners, frame fractions), for the zone grid
+  courtFit: number | null; // how well that calibration matches this rally's camera view (worker's score)
+  clipId: string;
+  rallyId: string;
+  canEdit: boolean;
+  updating: boolean; // contacts and zones are being re-run
 };
 // Which feet are planted at each frame of the rally: bit 1 = left, bit 2 = right.
 type Planted = Uint8Array;
@@ -64,6 +72,39 @@ function drawZones(ctx: CanvasRenderingContext2D, H: Mat3, w: number, h: number,
   ctx.setLineDash([6 * dpr, 5 * dpr]);
   for (const x of [-SINGLES, -COLUMN / 2, COLUMN / 2, SINGLES]) line(P(x, 0), P(x, 6.7));
   for (const y of ROWS) line(P(-SINGLES, y), P(SINGLES, y));
+  ctx.restore();
+}
+
+// Corners being clicked for a new calibration, with the court they make once all four are in.
+function drawDraft(ctx: CanvasRenderingContext2D, draft: Pt[], w: number, h: number, dpr: number) {
+  ctx.save();
+  if (draft.length === 4 && !checkCorners(draft)) {
+    const H = courtToFrame(draft);
+    if (H) {
+      ctx.lineWidth = 2 * dpr;
+      for (const [a, b] of [...COURT_LINES, NET_LINE]) {
+        const [ax, ay] = project(H, a);
+        const [bx, by] = project(H, b);
+        ctx.strokeStyle = a === NET_LINE[0] ? "#ffffff" : "#ffd84d";
+        ctx.beginPath();
+        ctx.moveTo(ax * w, ay * h);
+        ctx.lineTo(bx * w, by * h);
+        ctx.stroke();
+      }
+    }
+  }
+  ctx.font = `${12 * dpr}px system-ui, sans-serif`;
+  draft.forEach(([x, y], i) => {
+    ctx.fillStyle = "#ffd84d";
+    ctx.strokeStyle = "#111";
+    ctx.lineWidth = 2 * dpr;
+    ctx.beginPath();
+    ctx.arc(x * w, y * h, 7 * dpr, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.fillText(CORNER_NAMES[i], x * w + 10 * dpr, y * h - 8 * dpr);
+  });
   ctx.restore();
 }
 
@@ -133,7 +174,8 @@ function drawOverlay(ctx: CanvasRenderingContext2D, data: Overlay, frame: number
   ctx.globalAlpha = 1;
 }
 
-export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, contacts, corners }: Props) {
+export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, contacts, corners, courtFit, clipId, rallyId, canEdit, updating }: Props) {
+  const router = useRouter();
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const data = useRef<Overlay | null>(null);
@@ -153,6 +195,11 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
     return p;
   }, [contacts, start, end]);
   const plantedRef = useRef(planted);
+  const [calibrating, setCalibrating] = useState(false);
+  const [draft, setDraft] = useState<Pt[]>([]);
+  const draftRef = useRef<Pt[] | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
 
   const toFrame = useCallback((seconds: number) => Math.round(seconds * fps), [fps]);
 
@@ -167,6 +214,7 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
       return;
     }
     drawOverlay(ctx, d, f, c.width, c.height, window.devicePixelRatio || 1, plantedRef.current, zonesRef.current);
+    if (draftRef.current) drawDraft(ctx, draftRef.current, c.width, c.height, window.devicePixelRatio || 1);
     shown.current = f;
   }, []);
 
@@ -254,9 +302,33 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
 
   useEffect(() => {
     plantedRef.current = planted;
-    zonesRef.current = showZones && corners ? courtToFrame(corners) : null;
+    zonesRef.current = showZones && corners && !calibrating ? courtToFrame(corners) : null;
+    draftRef.current = calibrating ? draft : null;
     paint(shown.current >= 0 ? shown.current : start);
-  }, [planted, showZones, corners, paint, start]);
+  }, [planted, showZones, corners, calibrating, draft, paint, start]);
+
+  function startCalibrating() {
+    video.current?.pause();
+    setDraft([]);
+    setMessage(null);
+    setCalibrating(true);
+  }
+
+  function addCorner(e: React.PointerEvent<HTMLCanvasElement>) {
+    if (!calibrating || draft.length >= 4) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    setDraft([...draft, [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]]);
+  }
+
+  async function saveCalibration() {
+    setSaving(true);
+    const res = await recalibrateRally(clipId, rallyId, draft, frame);
+    setSaving(false);
+    if (!res.ok) return setMessage({ tone: "bad", text: res.message });
+    setCalibrating(false);
+    setMessage({ tone: "good", text: "Calibration saved. Contacts and zones are being worked out again; this takes about a minute." });
+    router.refresh();
+  }
 
   function changeRate(r: number) {
     setRate(r);
@@ -325,11 +397,38 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
           onPause={() => setPlaying(false)}
           onSeeked={(e) => paint(toFrame(e.currentTarget.currentTime))}
         />
-        <canvas ref={canvas} className="overlay" aria-hidden="true" />
-        {loaded !== "ready" ? (
+        <canvas ref={canvas} className={`overlay ${calibrating ? "picking" : ""}`} aria-hidden="true" onPointerDown={addCorner} />
+        {calibrating ? (
+          <div className="stage-hint">
+            {draft.length < 4 ? `Click the ${CORNER_NAMES[draft.length]} outer corner (${draft.length + 1} of 4)` : (checkCorners(draft) ?? "Check the yellow lines sit on the court, then save.")}
+          </div>
+        ) : loaded !== "ready" ? (
           <div className="stage-hint">{loaded === "loading" ? "Loading the tracking…" : "Couldn't load the tracking. Refresh to try again."}</div>
         ) : null}
       </div>
+
+      {courtFit !== null && courtFit < COURT_FIT_OK && !calibrating && !updating ? (
+        <p className="notice warn">
+          The court calibration doesn&apos;t match this rally&apos;s camera view (the camera zoomed or moved), so its court positions and zones are wrong.
+          {canEdit ? " Use Recalibrate court on a clear frame of this rally." : " The uploader or admin can recalibrate it."}
+        </p>
+      ) : null}
+      {updating ? <p className="notice">Working out contacts and zones again…</p> : null}
+      {message ? <p className={`notice ${message.tone}`}>{message.text}</p> : null}
+      {calibrating ? (
+        <div className="row">
+          <button type="button" className="btn small primary" disabled={draft.length < 4 || !!checkCorners(draft) || saving} onClick={saveCalibration}>
+            {saving ? "Saving…" : "Save for this rally"}
+          </button>
+          <button type="button" className="btn small" disabled={saving || draft.length === 0} onClick={() => setDraft(draft.slice(0, -1))}>
+            Undo corner
+          </button>
+          <button type="button" className="btn small ghost" disabled={saving} onClick={() => setCalibrating(false)}>
+            Cancel
+          </button>
+          <span className="small muted">Click the four outer corners (where the outermost side lines meet the baselines): near-left, near-right, far-right, far-left.</span>
+        </div>
+      ) : null}
 
       <div className="transport">
         <button type="button" className="btn small" onClick={togglePlay}>
@@ -345,6 +444,11 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
           {secs(frame)} s / {secs(end)} s · frame {frame}
         </span>
         <div className="spacer" />
+        {canEdit && !calibrating ? (
+          <button type="button" className="btn small ghost" onClick={startCalibrating} disabled={updating}>
+            Recalibrate court
+          </button>
+        ) : null}
         {corners ? (
           <label className="small muted toggle">
             <input type="checkbox" checked={showZones} onChange={(e) => setShowZones(e.target.checked)} /> Show zones

@@ -86,6 +86,10 @@ export function checkCorners(corners: Pt[]): string | null {
   return null;
 }
 
+// The worker scores how well a rally's calibration matches its camera view (share of the court lines
+// on white pixels, about 0.95 when it fits); below this the camera has moved and zones would be wrong.
+export const COURT_FIT_OK = 0.75;
+
 // Frame fractions → court metres (what the worker uses).
 export const frameToCourt = (corners: Pt[]) => homography(corners, COURT_CORNERS);
 // Court metres → frame fractions (for drawing).

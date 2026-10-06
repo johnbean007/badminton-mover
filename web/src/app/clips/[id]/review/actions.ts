@@ -95,8 +95,9 @@ export async function saveCalibration(clipId: string, corners: Pt[], frame: numb
   if (onlySegmentId) q = q.eq("id", onlySegmentId);
   const { error: linkError } = await q;
   if (linkError) return { ok: false, message: "Saved the calibration but couldn't apply it. Try again." };
-  // The near-side check uses the court, so it reruns whenever the court changes.
-  if (ctx.clip.shirt_colour) await queueJob(clipId, "sidecheck", ctx.member.id);
+  // The near-side check (and the court-fit check that runs with it) uses the court, so it reruns
+  // whenever the court changes.
+  await queueJob(clipId, "sidecheck", ctx.member.id);
   return { ok: true, calibrationId: cal.id };
 }
 

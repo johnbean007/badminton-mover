@@ -10,6 +10,7 @@ import numpy as np
 
 import analyse as an
 import contacts as ct
+import courtfit as cf
 
 
 class GapFilling(unittest.TestCase):
@@ -115,6 +116,29 @@ class Contacts(unittest.TestCase):
         H = np.eye(3)
         found = ct.detect(kp, conf, fps, 100, H, "R")
         self.assertEqual([(c["foot"], c["start_frame"], c["end_frame"]) for c in found], [("L", 109, 124), ("L", 139, 154)])
+
+
+class CourtFit(unittest.TestCase):
+    def test_fits_drawn_court_and_rejects_shifted_one(self):
+        """A court drawn in white on green: its own calibration fits, a zoomed-out one doesn't."""
+        W, Hh = 1280, 720
+        corners = np.float32([[0.15, 0.93], [0.85, 0.93], [0.66, 0.47], [0.34, 0.47]])
+        court = np.float32([[-3.05, 6.7], [3.05, 6.7], [3.05, -6.7], [-3.05, -6.7]])
+        import cv2
+
+        H = cv2.getPerspectiveTransform(corners, court).astype(float)
+        frame = np.zeros((Hh, W, 3), np.uint8)
+        frame[:] = (90, 160, 60)
+        inv = np.linalg.inv(H)
+        for (x0, y0), (x1, y1) in cf.LINES:
+            pts = []
+            for x, y in ((x0, y0), (x1, y1)):
+                p = inv @ [x, y, 1]
+                pts.append((int(p[0] / p[2] * W), int(p[1] / p[2] * Hh)))
+            cv2.line(frame, pts[0], pts[1], (255, 255, 255), 3)
+        self.assertGreater(cf.line_fit(frame, H), 0.95)
+        zoomed = cv2.getPerspectiveTransform((corners - 0.5) * 0.85 + 0.5, court).astype(float)
+        self.assertLess(cf.line_fit(frame, zoomed), cf.FIT_OK)
 
 
 if __name__ == "__main__":

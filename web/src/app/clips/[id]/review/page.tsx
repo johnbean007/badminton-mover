@@ -50,7 +50,7 @@ export default async function ReviewPage({ params }: PageProps<"/clips/[id]/revi
   }
 
   const [{ data: rallies }, { data: calibrations }, { data: sideJobs }] = await Promise.all([
-    supabase.from("rallies").select("id, start_frame, end_frame, included, thumb_key, calibration_id, near_side").eq("clip_id", id).order("start_frame"),
+    supabase.from("rallies").select("id, start_frame, end_frame, included, thumb_key, calibration_id, near_side, court_fit").eq("clip_id", id).order("start_frame"),
     supabase.from("calibrations").select("id, corners, frame").eq("clip_id", id).order("created_at"),
     supabase.from("jobs").select("status, progress").eq("clip_id", id).eq("type", "sidecheck").order("created_at", { ascending: false }).limit(1),
   ]);
@@ -66,6 +66,7 @@ export default async function ReviewPage({ params }: PageProps<"/clips/[id]/revi
     calibrationId: r.calibration_id,
   }));
   const nearSide = Object.fromEntries((rallies ?? []).map((r) => [r.id, r.near_side as "near" | "far" | "unclear" | null]));
+  const courtFit = Object.fromEntries((rallies ?? []).map((r) => [r.id, r.court_fit === null ? null : Number(r.court_fit)]));
 
   return (
     <>
@@ -80,6 +81,7 @@ export default async function ReviewPage({ params }: PageProps<"/clips/[id]/revi
           videoUrl={await signDownload(clip.playback_key, 6 * 3600)}
           initialSegments={segments}
           nearSide={nearSide}
+          courtFit={courtFit}
           thumbUrls={thumbUrls}
           calibrations={(calibrations ?? []).map((c) => ({ id: c.id, corners: c.corners as Pt[], frame: c.frame ?? 0 }))}
           initialShirt={clip.shirt_colour}

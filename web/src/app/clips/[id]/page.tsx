@@ -22,7 +22,7 @@ export default async function ViewerPage({ params, searchParams }: PageProps<"/c
   const { data: clip } = await supabase
     .from("clips")
     .select(
-      "id, status, error, fps, playback_key, tournament, round, match_date, source_url, player:players!clips_player_id_fkey(name, handedness), opponent:players!clips_opponent_id_fkey(name)",
+      "id, owner_id, status, error, fps, playback_key, tournament, round, match_date, source_url, player:players!clips_player_id_fkey(name, handedness), opponent:players!clips_opponent_id_fkey(name)",
     )
     .eq("id", id)
     .maybeSingle();
@@ -35,7 +35,7 @@ export default async function ViewerPage({ params, searchParams }: PageProps<"/c
 
   const { data: rallyRows } = await supabase
     .from("rallies")
-    .select("id, start_frame, end_frame, status, calibration_id")
+    .select("id, start_frame, end_frame, status, calibration_id, court_fit")
     .eq("clip_id", id)
     .in("status", ["queued", "analysing", "ready", "failed"])
     .order("start_frame");
@@ -43,7 +43,10 @@ export default async function ViewerPage({ params, searchParams }: PageProps<"/c
   const ready = rallies.filter((r) => r.status === "ready");
   const wanted = Number(one(query.rally));
   const rally = ready.find((r) => r.number === wanted) ?? ready[0] ?? null;
-  const working = status === "queued" || status === "analysing" || rallies.some((r) => r.status === "queued" || r.status === "analysing");
+  const { data: reruns } = await supabase.from("jobs").select("status").eq("clip_id", id).eq("type", "reanalyse").order("created_at", { ascending: false }).limit(1);
+  const updating = reruns?.[0]?.status === "queued" || reruns?.[0]?.status === "running";
+  const working = updating || status === "queued" || status === "analysing" || rallies.some((r) => r.status === "queued" || r.status === "analysing");
+  const canEdit = clip.owner_id === member.id || member.role === "admin";
 
   const header = (
     <div className="row between end-align">
@@ -159,6 +162,11 @@ export default async function ViewerPage({ params, searchParams }: PageProps<"/c
             confidence: c.confidence === null ? null : Number(c.confidence),
           }))}
           corners={(calibration?.corners as Pt[] | undefined) ?? null}
+          courtFit={rally.court_fit === null ? null : Number(rally.court_fit)}
+          clipId={id}
+          rallyId={rally.id}
+          canEdit={canEdit && status === "ready"}
+          updating={updating}
         />
       </main>
     </>

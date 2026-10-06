@@ -231,3 +231,5 @@ textarea.input { resize: vertical; font: inherit; }
 .contact.low { opacity: .55; border: 1.5px dashed var(--ink); }
 .contact.now { box-shadow: 0 0 0 2px var(--ink); }
 .toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.viewer canvas.overlay.picking { pointer-events: auto; cursor: crosshair; }
+.notice:not(.good):not(.bad):not(.warn) { background: var(--surface-2); color: var(--ink-2); }

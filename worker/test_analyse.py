@@ -140,6 +140,13 @@ class CourtFit(unittest.TestCase):
         zoomed = cv2.getPerspectiveTransform((corners - 0.5) * 0.85 + 0.5, court).astype(float)
         self.assertLess(cf.line_fit(frame, zoomed), cf.FIT_OK)
 
+        # Roughly clicked corners (a few pixels to ~25 px out) snap back onto the drawn lines.
+        rough = corners + np.float32([[0.01, 0.03], [-0.008, 0.035], [0.004, -0.008], [-0.003, 0.006]])
+        snapped = cf.snap([frame], rough)
+        self.assertIsNotNone(snapped)
+        self.assertGreater(snapped[1], 0.95)
+        np.testing.assert_allclose(snapped[0], corners, atol=0.004)
+
 
 if __name__ == "__main__":
     unittest.main()

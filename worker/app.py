@@ -226,7 +226,6 @@ def sidecheck(job_id: str) -> None:
     import numpy as np
     from rtmlib import YOLOX
 
-    import courtfit as cf
     import sidecheck as sc
     import store
 
@@ -243,7 +242,7 @@ def sidecheck(job_id: str) -> None:
             raise ValueError("No playback copy yet")
         rallies = store.select("rallies", clip_id=f"eq.{clip_id}", included="eq.true", calibration_id="not.is.null",
                                select="id,start_frame,end_frame,calibration_id", order="start_frame")
-        cals = {c["id"]: np.array(c["homography"], float) for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,homography")}
+        cals = {c["id"]: c for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,corners,homography")}
         # The court fit needs only the calibration; the side check also needs the shirt colour.
         shirt = sc.lab(clip["shirt_colour"]) if clip["shirt_colour"] else None
         detector = YOLOX(YOLOX_M, model_input_size=(640, 640), backend="onnxruntime", device="cpu") if shirt is not None else None
@@ -254,13 +253,11 @@ def sidecheck(job_id: str) -> None:
             path = os.path.join(tmp, "playback.mp4")
             store.download(clip["playback_key"], path)
             for i, r in enumerate(rallies):
-                H = cals[r["calibration_id"]]
-                values = {"court_fit": cf.rally_fit(path, r["start_frame"], r["end_frame"], H)}
+                H, _ = check_court(path, clip_id, r, cals[r["calibration_id"]])
                 if shirt is not None:
                     side, votes = sc.check_segment(sc.sample_frames(path, r["start_frame"], r["end_frame"]), detect, H, shirt)
-                    values["near_side"] = side
+                    store.update("rallies", {"near_side": side}, id=f"eq.{r['id']}")
                     results[r["id"]] = votes
-                store.update("rallies", values, id=f"eq.{r['id']}")
                 store.update("jobs", {"progress": 0.1 + 0.9 * (i + 1) / max(1, len(rallies))}, id=f"eq.{job_id}")
         store.update("jobs", {"status": "done", "progress": 1, "finished_at": now(), "error": None,
                               "versions": {"sidecheck": "1", "detector": "yolox_m_humanart", "votes": results}}, id=f"eq.{job_id}")
@@ -280,6 +277,31 @@ def subject_id(rally_id: str, player_id: str) -> str:
         return rows[0]["id"]
     store.remove("rally_subjects", rally_id=f"eq.{rally_id}")  # the clip's player changed
     return store._insert_returning("rally_subjects", {"rally_id": rally_id, "player_id": player_id, "side": "near"})["id"]
+
+
+def check_court(path: str, clip_id: str, rally: dict, cal: dict):
+    """Scores how well the rally's calibration fits its camera view and, when it's off, snaps it onto
+    the visible court lines, saving the result as the rally's own calibration. Returns the
+    homography to use and the fit."""
+    import numpy as np
+
+    import courtfit as cf
+    import store
+
+    H = np.array(cal["homography"], float)
+    frames = cf.sample_frames(path, rally["start_frame"], rally["end_frame"])
+    fit = cf.frames_fit(frames, H)
+    if fit < cf.SNAP_BELOW and frames:
+        snapped = cf.snap(frames, cal["corners"])
+        if snapped:
+            corners, fit = snapped
+            H = cf.homography_from_corners(corners)
+            new = store._insert_returning("calibrations", {
+                "clip_id": clip_id, "corners": corners.tolist(), "homography": H.tolist(),
+                "frame": (rally["start_frame"] + rally["end_frame"]) // 2})
+            store.update("rallies", {"calibration_id": new["id"]}, id=f"eq.{rally['id']}")
+    store.update("rallies", {"court_fit": fit}, id=f"eq.{rally['id']}")
+    return H, fit
 
 
 def save_contacts(rally_id: str, player_id: str, pose_bytes: bytes, H, hand: str | None) -> dict:
@@ -340,7 +362,6 @@ def analyse(job_id: str) -> None:
     import numpy as np
 
     import analyse as an
-    import courtfit as cf
     import store
 
     now = lambda: dt.datetime.now(dt.UTC).isoformat()  # noqa: E731
@@ -369,7 +390,8 @@ def analyse(job_id: str) -> None:
                                select="id,start_frame,end_frame,calibration_id", order="start_frame")
         if not rallies:
             raise ValueError("No calibrated rallies waiting for analysis")
-        cals = {c["id"]: np.array(c["homography"], float) for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,homography")}
+        cal_rows = {c["id"]: c for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,corners,homography")}
+        cals = {k: np.array(c["homography"], float) for k, c in cal_rows.items()}
         store.update("clips", {"status": "analysing", "error": None}, id=f"eq.{clip_id}")
 
         pose, tracker, versions = gpu_models()
@@ -399,9 +421,9 @@ def analyse(job_id: str) -> None:
                     store.insert("shuttle_hits", [{"rally_id": rid, "frame": r["start_frame"] + h["index"], "hitter": h["hitter"],
                                                    "confidence": h["confidence"]} for h in res.hits])
                     stats = res.stats
-                    stats["contacts"] = save_contacts(rid, clip["player_id"], pose_bytes, cals[r["calibration_id"]], hand)
-                    court_fit = cf.rally_fit(path, r["start_frame"], r["end_frame"], cals[r["calibration_id"]])
-                    store.update("rallies", {**keys, "status": "ready", "court_fit": court_fit}, id=f"eq.{rid}")
+                    H, stats["court_fit"] = check_court(path, clip_id, r, cal_rows[r["calibration_id"]])
+                    stats["contacts"] = save_contacts(rid, clip["player_id"], pose_bytes, H, hand)
+                    store.update("rallies", {**keys, "status": "ready"}, id=f"eq.{rid}")
                     results[rid] = stats
                     done += 1
                 except Exception as e:  # noqa: BLE001
@@ -452,15 +474,13 @@ def reanalyse(job_id: str) -> None:
         hand = (clip.get("player") or {}).get("handedness")
         rallies = store.select("rallies", clip_id=f"eq.{clip_id}", status="eq.ready", pose_key="not.is.null",
                                select="id,start_frame,end_frame,pose_key,calibration_id", order="start_frame")
-        cals = {c["id"]: np.array(c["homography"], float) for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,homography")}
+        cals = {c["id"]: c for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,corners,homography")}
         results = {}
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "playback.mp4")
             store.download(clip["playback_key"], path)
             for i, r in enumerate(rallies):
-                H = cals[r["calibration_id"]]
-                fit = cf.rally_fit(path, r["start_frame"], r["end_frame"], H)
-                store.update("rallies", {"court_fit": fit}, id=f"eq.{r['id']}")
+                H, fit = check_court(path, clip_id, r, cals[r["calibration_id"]])
                 results[r["id"]] = {"court_fit": fit, **save_contacts(r["id"], clip["player_id"], store.get_bytes(r["pose_key"]), H, hand)}
                 store.update("jobs", {"progress": round(0.05 + 0.95 * (i + 1) / len(rallies), 3)}, id=f"eq.{job_id}")
         store.update("jobs", {"status": "done", "progress": 1, "finished_at": now(), "error": None,

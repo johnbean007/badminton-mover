@@ -90,6 +90,20 @@ export function checkCorners(corners: Pt[]): string | null {
 // on white pixels, about 0.95 when it fits); below this the camera has moved and zones would be wrong.
 export const COURT_FIT_OK = 0.75;
 
+// When a zoomed-in camera cuts off the near baseline, the near points can instead be where the outer
+// side lines meet the near doubles long service line (0.76 m in front of the baseline).
+export type NearPoints = "baseline" | "service";
+const LONG_SERVICE = 5.94;
+export const clickModel = (near: NearPoints): Pt[] =>
+  near === "baseline" ? COURT_CORNERS : [[-3.05, LONG_SERVICE], [3.05, LONG_SERVICE], [3.05, -6.7], [-3.05, -6.7]];
+
+// The four outer court corners (frame fractions, possibly off-screen) implied by clicked points, so
+// every calibration is stored the same way whichever points were clicked.
+export function outerCornersFromClicks(clicks: Pt[], near: NearPoints): Pt[] | null {
+  const toFrame = homography(clickModel(near), clicks);
+  return toFrame ? COURT_CORNERS.map((p) => project(toFrame, p)) : null;
+}
+
 // Frame fractions → court metres (what the worker uses).
 export const frameToCourt = (corners: Pt[]) => homography(corners, COURT_CORNERS);
 // Court metres → frame fractions (for drawing).

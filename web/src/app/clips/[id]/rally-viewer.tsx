@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { CORNER_NAMES, COURT_FIT_OK, COURT_LINES, checkCorners, courtToFrame, type Mat3, NET_LINE, project, type Pt } from "@/lib/court";
+import { CORNER_NAMES, COURT_FIT_OK, COURT_LINES, checkCorners, clickModel, courtToFrame, homography, type Mat3, NET_LINE, type NearPoints, project, type Pt } from "@/lib/court";
 
 import { recalibrateRally } from "./actions";
 
@@ -75,11 +75,14 @@ function drawZones(ctx: CanvasRenderingContext2D, H: Mat3, w: number, h: number,
   ctx.restore();
 }
 
-// Corners being clicked for a new calibration, with the court they make once all four are in.
-function drawDraft(ctx: CanvasRenderingContext2D, draft: Pt[], w: number, h: number, dpr: number) {
+const pointNames = (near: NearPoints) =>
+  near === "baseline" ? CORNER_NAMES.map((n) => `${n} corner`) : ["near-left service line end", "near-right service line end", "far-right corner", "far-left corner"];
+
+// Points being clicked for a new calibration, with the court they make once all four are in.
+function drawDraft(ctx: CanvasRenderingContext2D, draft: Pt[], near: NearPoints, w: number, h: number, dpr: number) {
   ctx.save();
   if (draft.length === 4 && !checkCorners(draft)) {
-    const H = courtToFrame(draft);
+    const H = homography(clickModel(near), draft);
     if (H) {
       ctx.lineWidth = 2 * dpr;
       for (const [a, b] of [...COURT_LINES, NET_LINE]) {
@@ -103,7 +106,7 @@ function drawDraft(ctx: CanvasRenderingContext2D, draft: Pt[], w: number, h: num
     ctx.fill();
     ctx.stroke();
     ctx.fillStyle = "#fff";
-    ctx.fillText(CORNER_NAMES[i], x * w + 10 * dpr, y * h - 8 * dpr);
+    ctx.fillText(pointNames(near)[i], x * w + 10 * dpr, y * h - 8 * dpr);
   });
   ctx.restore();
 }
@@ -198,6 +201,8 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
   const [calibrating, setCalibrating] = useState(false);
   const [draft, setDraft] = useState<Pt[]>([]);
   const draftRef = useRef<Pt[] | null>(null);
+  const [near, setNear] = useState<NearPoints>("baseline");
+  const nearRef = useRef<NearPoints>("baseline");
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
   // Jumping deep into a long video takes a while, and until the browser has shown a frame from this
@@ -227,7 +232,7 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
       return;
     }
     drawOverlay(ctx, d, f, c.width, c.height, window.devicePixelRatio || 1, plantedRef.current, zonesRef.current);
-    if (draftRef.current) drawDraft(ctx, draftRef.current, c.width, c.height, window.devicePixelRatio || 1);
+    if (draftRef.current) drawDraft(ctx, draftRef.current, nearRef.current, c.width, c.height, window.devicePixelRatio || 1);
     shown.current = f;
   }, []);
 
@@ -320,8 +325,9 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
     plantedRef.current = planted;
     zonesRef.current = showZones && corners && !calibrating ? courtToFrame(corners) : null;
     draftRef.current = calibrating ? draft : null;
+    nearRef.current = near;
     paint(shown.current >= 0 ? shown.current : start);
-  }, [planted, showZones, corners, calibrating, draft, paint, start]);
+  }, [planted, showZones, corners, calibrating, draft, near, paint, start]);
 
   function startCalibrating() {
     video.current?.pause();
@@ -339,7 +345,7 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
   async function saveCalibration() {
     setSaving(true);
     // The frame actually on screen, not the one asked for.
-    const res = await recalibrateRally(clipId, rallyId, draft, video.current ? toFrame(video.current.currentTime) : frame);
+    const res = await recalibrateRally(clipId, rallyId, draft, near, video.current ? toFrame(video.current.currentTime) : frame);
     setSaving(false);
     if (!res.ok) return setMessage({ tone: "bad", text: res.message });
     setCalibrating(false);
@@ -421,7 +427,7 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
         <canvas ref={canvas} className={`overlay ${calibrating ? "picking" : ""}`} aria-hidden="true" onPointerDown={addCorner} />
         {calibrating ? (
           <div className="stage-hint">
-            {draft.length < 4 ? `Click the ${CORNER_NAMES[draft.length]} outer corner (${draft.length + 1} of 4)` : (checkCorners(draft) ?? "Check the yellow lines sit on the court, then save.")}
+            {draft.length < 4 ? `Click the ${pointNames(near)[draft.length]} (${draft.length + 1} of 4)` : (checkCorners(draft) ?? "Check the yellow lines sit on the court, then save.")}
           </div>
         ) : !onRally ? (
           <div className="stage-hint">Loading the video…</div>
@@ -449,7 +455,27 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
           <button type="button" className="btn small ghost" disabled={saving} onClick={() => setCalibrating(false)}>
             Cancel
           </button>
-          <span className="small muted">Click the four outer corners (where the outermost side lines meet the baselines): near-left, near-right, far-right, far-left.</span>
+          <div className="speeds" role="group" aria-label="Near points">
+            {(["baseline", "service"] as const).map((n) => (
+              <button
+                key={n}
+                type="button"
+                className={`btn small ${near === n ? "primary" : ""}`}
+                aria-pressed={near === n}
+                onClick={() => {
+                  setNear(n);
+                  setDraft([]);
+                }}
+              >
+                {n === "baseline" ? "Baseline corners" : "Service line ends"}
+              </button>
+            ))}
+          </div>
+          <span className="small muted">
+            {near === "baseline"
+              ? "Click where the outermost side lines meet the baselines: near-left, near-right, far-right, far-left. If the near baseline is cut off, switch to Service line ends."
+              : "For the near points, click where the outermost side lines meet the near doubles long service line (the line 76 cm in front of the baseline). Then the far-right and far-left baseline corners."}
+          </span>
         </div>
       ) : null}
 

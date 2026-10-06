@@ -200,6 +200,19 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
   const draftRef = useRef<Pt[] | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
+  // Jumping deep into a long video takes a while, and until the browser has shown a frame from this
+  // rally it keeps showing an old one. Nothing is drawn and no calibration is taken until then.
+  const [onRally, setOnRally] = useState(false);
+  const onRallyRef = useRef(false);
+  const arrived = useCallback(
+    (f: number) => {
+      if (!onRallyRef.current && f >= start - 1 && f <= end + 1) {
+        onRallyRef.current = true;
+        setOnRally(true);
+      }
+    },
+    [start, end],
+  );
 
   const toFrame = useCallback((seconds: number) => Math.round(seconds * fps), [fps]);
 
@@ -209,7 +222,7 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
     if (!c) return;
     const ctx = c.getContext("2d");
     if (!ctx) return;
-    if (!d) {
+    if (!d || !onRallyRef.current) {
       ctx.clearRect(0, 0, c.width, c.height);
       return;
     }
@@ -258,6 +271,7 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
       let handle = 0;
       const onFrame = (_now: number, meta: VideoFrameCallbackMetadata) => {
         const f = toFrame(meta.mediaTime);
+        arrived(f);
         paint(f);
         setFrame(f);
         if (f >= end && !v.paused) v.pause();
@@ -270,6 +284,7 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
     const tick = () => {
       const f = toFrame(v.currentTime);
       if (f !== shown.current) {
+        arrived(f);
         paint(f);
         setFrame(f);
       }
@@ -278,7 +293,7 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [toFrame, paint, end]);
+  }, [toFrame, paint, end, arrived]);
 
   const seek = useCallback(
     (f: number) => {
@@ -286,10 +301,11 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
       const clamped = Math.max(start, Math.min(end, Math.round(f)));
       // Aim at the middle of the frame so rounding never lands on its neighbour.
       if (v) v.currentTime = (clamped + 0.25) / fps;
+      // The overlay is drawn when the video shows the frame (seeked / frame callbacks), not now:
+      // drawing ahead of a slow seek would put it over the old picture.
       setFrame(clamped);
-      paint(clamped);
     },
-    [start, end, fps, paint],
+    [start, end, fps],
   );
 
   const togglePlay = useCallback(() => {
@@ -322,7 +338,8 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
 
   async function saveCalibration() {
     setSaving(true);
-    const res = await recalibrateRally(clipId, rallyId, draft, frame);
+    // The frame actually on screen, not the one asked for.
+    const res = await recalibrateRally(clipId, rallyId, draft, video.current ? toFrame(video.current.currentTime) : frame);
     setSaving(false);
     if (!res.ok) return setMessage({ tone: "bad", text: res.message });
     setCalibrating(false);
@@ -395,13 +412,19 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
           }}
           onPlay={() => setPlaying(true)}
           onPause={() => setPlaying(false)}
-          onSeeked={(e) => paint(toFrame(e.currentTarget.currentTime))}
+          onSeeked={(e) => {
+            const f = toFrame(e.currentTarget.currentTime);
+            arrived(f);
+            paint(f);
+          }}
         />
         <canvas ref={canvas} className={`overlay ${calibrating ? "picking" : ""}`} aria-hidden="true" onPointerDown={addCorner} />
         {calibrating ? (
           <div className="stage-hint">
             {draft.length < 4 ? `Click the ${CORNER_NAMES[draft.length]} outer corner (${draft.length + 1} of 4)` : (checkCorners(draft) ?? "Check the yellow lines sit on the court, then save.")}
           </div>
+        ) : !onRally ? (
+          <div className="stage-hint">Loading the video…</div>
         ) : loaded !== "ready" ? (
           <div className="stage-hint">{loaded === "loading" ? "Loading the tracking…" : "Couldn't load the tracking. Refresh to try again."}</div>
         ) : null}
@@ -445,7 +468,7 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
         </span>
         <div className="spacer" />
         {canEdit && !calibrating ? (
-          <button type="button" className="btn small ghost" onClick={startCalibrating} disabled={updating}>
+          <button type="button" className="btn small ghost" onClick={startCalibrating} disabled={updating || !onRally}>
             Recalibrate court
           </button>
         ) : null}

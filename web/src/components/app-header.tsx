@@ -12,6 +12,7 @@ export function AppHeader({ member }: { member: Member }) {
         </Link>
         <nav className="nav" aria-label="Main">
           <Link href="/">Clips</Link>
+          <Link href="/clips/new">Upload</Link>
           {member.role === "admin" ? <Link href="/admin/members">Members</Link> : null}
         </nav>
         <div className="spacer" />

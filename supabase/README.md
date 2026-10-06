@@ -1,4 +1,4 @@
-# Supabase setup (milestone 1)
+# Supabase setup
 
 One-off steps in the Supabase dashboard. Do these yourself; never paste keys into chat or commit them.
 
@@ -8,9 +8,7 @@ One-off steps in the Supabase dashboard. Do these yourself; never paste keys int
 4. **URLs.** Authentication → URL Configuration:
    - Site URL: `http://localhost:3000` (change to the Vercel URL after deploying)
    - Redirect URLs: add `http://localhost:3000/auth/confirm` (and later `https://<vercel-url>/auth/confirm`)
-5. **Email templates.** Authentication → Emails. Make the links go through the app's `/auth/confirm` route:
-   - Magic link: `<a href="{{ .RedirectTo }}?token_hash={{ .TokenHash }}&type=email">Sign in to Badminton Mover</a>`
-   - Invite user: `<a href="{{ .RedirectTo }}?token_hash={{ .TokenHash }}&type=invite">Accept your invite to Badminton Mover</a>`
+5. **Email templates.** Leave the defaults. Custom templates need a custom SMTP sender; `/auth/confirm` handles the default sign-in links.
 6. **Keys.** Copy `web/.env.example` to `web/.env.local` and fill in the URL, publishable key and secret key from Project Settings → API Keys.
 7. **Make yourself admin.** Authentication → Users → Invite user → your email. Then in the SQL Editor:
    ```sql
@@ -18,3 +16,9 @@ One-off steps in the Supabase dashboard. Do these yourself; never paste keys int
    ```
 
 Supabase's built-in email sender is rate-limited (a few emails an hour). That's fine for a small club; add a custom SMTP sender later if invites start failing.
+
+## Later migrations
+
+Run each new file in `migrations/` once, in date order: SQL Editor → New query → paste → Run.
+
+- `20261006000000_players_clips.sql` (milestone 2): players and clips. Applied 2026-10-06.

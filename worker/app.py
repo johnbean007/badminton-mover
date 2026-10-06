@@ -9,6 +9,7 @@ trigger call got lost.
     .venv/bin/modal run app.py::prescan_now --clip-id <uuid>   # pre-scan one clip by hand
     .venv/bin/modal run app.py::gpu_check                      # pose and shuttle models load on the GPU
     .venv/bin/modal run app.py::analyse_now --clip-id <uuid>   # (re-)analyse a clip's chosen rallies
+    .venv/bin/modal run app.py::reanalyse_now --clip-id <uuid> # re-run contacts and zones from stored pose
 
 The shuttle tracker's checkpoints live in the Modal volume badminton-mover-models, put there once with
     .venv/bin/modal volume put badminton-mover-models ../spike/vendor/TrackNetV3/ckpts/TrackNet_best.pt /tracknet/
@@ -37,7 +38,7 @@ base = modal.Image.debian_slim(python_version="3.12")
 cpu_deps = base.apt_install("ffmpeg").pip_install(
     "boto3", "httpx", "numpy>=2", "opencv-python-headless>=4.10", "scenedetect>=0.6.6", "fastapi[standard]"
 )
-cpu_image = cpu_deps.add_local_python_source("prescan", "store")
+cpu_image = cpu_deps.add_local_python_source("prescan", "store", "contacts")
 # Person detector for the near-side check, baked into the image so jobs don't download it.
 detect_image = (
     cpu_deps.apt_install("libgl1", "libglib2.0-0")
@@ -66,7 +67,7 @@ gpu_image = (
     .pip_install("boto3", "httpx", "numpy>=2", "pillow", "rtmlib")
     .run_commands("pip uninstall -y onnxruntime", "pip install onnxruntime-gpu")
     .run_function(fetch_pose_models)
-    .add_local_python_source("store", "analyse", "tracknet", "tracknet_model")
+    .add_local_python_source("store", "analyse", "tracknet", "tracknet_model", "contacts")
 )
 
 
@@ -265,6 +266,32 @@ def sidecheck(job_id: str) -> None:
 
 # --- Analysis: pose, shuttle and hits ------------------------------------------------------------
 
+def subject_id(rally_id: str, player_id: str) -> str:
+    """The rally's tracked-player row, kept across re-runs so contacts (and later corrections) stay attached."""
+    import store
+
+    rows = store.select("rally_subjects", rally_id=f"eq.{rally_id}", player_id=f"eq.{player_id}", select="id")
+    if rows:
+        return rows[0]["id"]
+    store.remove("rally_subjects", rally_id=f"eq.{rally_id}")  # the clip's player changed
+    return store._insert_returning("rally_subjects", {"rally_id": rally_id, "player_id": player_id, "side": "near"})["id"]
+
+
+def save_contacts(rally_id: str, player_id: str, pose_bytes: bytes, H, hand: str | None) -> dict:
+    """Foot contacts and zones from a rally's pose file. Replaces the rule-made contacts; contacts
+    members added or corrected stay."""
+    import contacts as ct
+    import store
+
+    pose = ct.load_pose(pose_bytes)
+    found = ct.detect(pose["kp"], pose["conf"], pose["meta"]["fps"], int(pose["frame"][0]), H, hand)
+    sid = subject_id(rally_id, player_id)
+    store.remove("contacts", subject_id=f"eq.{sid}", source="eq.rules")
+    store.insert("contacts", [{**{k: v for k, v in c.items() if k != "image_xy"}, "subject_id": sid, "rules_version": ct.RULES_VERSION}
+                              for c in found])
+    return ct.summary(found, len(pose["kp"]), pose["meta"]["fps"])
+
+
 def gpu_models():
     """The pose model on CUDA and the shuttle tracker, with the versions to record."""
     import onnxruntime as ort
@@ -325,12 +352,13 @@ def analyse(job_id: str) -> None:
             store.update("jobs", {"progress": round(min(p, 0.99), 3)}, id=f"eq.{job_id}")
 
     try:
-        clips = store.select("clips", id=f"eq.{clip_id}", select="original_key,fps,height,shirt_colour,player_id")
+        clips = store.select("clips", id=f"eq.{clip_id}", select="original_key,fps,height,shirt_colour,player_id,player:players!clips_player_id_fkey(handedness)")
         if not clips:
             store.update("jobs", {"status": "failed", "error": "Clip was deleted", "finished_at": now()}, id=f"eq.{job_id}")
             return
         clip = clips[0]
         fps = float(clip["fps"])
+        hand = (clip.get("player") or {}).get("handedness")
         rallies = store.select("rallies", clip_id=f"eq.{clip_id}", status="in.(queued,analysing)", calibration_id="not.is.null",
                                select="id,start_frame,end_frame,calibration_id", order="start_frame")
         if not rallies:
@@ -356,17 +384,18 @@ def analyse(job_id: str) -> None:
                     res = an.analyse_rally(path, r["start_frame"], r["end_frame"], fps, cals[r["calibration_id"]],
                                            clip["shirt_colour"], pose, tracker, lambda f: progress(base_p + span * f))
                     keys = {"pose_key": f"pose/{rid}.npz", "shuttle_key": f"shuttle/{rid}.npz"}
-                    store.put_bytes(an.pose_npz(res, versions), keys["pose_key"], "application/octet-stream")
+                    pose_bytes = an.pose_npz(res, versions)
+                    store.put_bytes(pose_bytes, keys["pose_key"], "application/octet-stream")
                     store.put_bytes(an.shuttle_npz(res, versions), keys["shuttle_key"], "application/octet-stream")
                     store.put_bytes(an.overlay_json(res), f"overlay/{rid}.json", "application/json")
                     # A re-run replaces the tracker's hits; hits members added stay.
                     store.remove("shuttle_hits", rally_id=f"eq.{rid}", source="eq.tracker")
                     store.insert("shuttle_hits", [{"rally_id": rid, "frame": r["start_frame"] + h["index"], "hitter": h["hitter"],
                                                    "confidence": h["confidence"]} for h in res.hits])
-                    store.remove("rally_subjects", rally_id=f"eq.{rid}")
-                    store.insert("rally_subjects", [{"rally_id": rid, "player_id": clip["player_id"], "side": "near"}])
+                    stats = res.stats
+                    stats["contacts"] = save_contacts(rid, clip["player_id"], pose_bytes, cals[r["calibration_id"]], hand)
                     store.update("rallies", {**keys, "status": "ready"}, id=f"eq.{rid}")
-                    results[rid] = res.stats
+                    results[rid] = stats
                     done += 1
                 except Exception as e:  # noqa: BLE001
                     traceback.print_exc()
@@ -386,6 +415,42 @@ def analyse(job_id: str) -> None:
         store.update("rallies", {"status": "failed"}, clip_id=f"eq.{clip_id}", status="in.(queued,analysing)")
         store.update("clips", {"status": "failed", "error": "Analysing the rallies failed. Retry, and if it fails again tell the admin."},
                      id=f"eq.{clip_id}")
+
+
+@app.function(image=cpu_image, secrets=secrets, timeout=15 * 60)
+def reanalyse(job_id: str) -> None:
+    """Re-runs the later stages (contacts and zones for now) from the stored pose files: seconds on a
+    CPU instead of tracking the pose again. The clip stays viewable throughout."""
+    import datetime as dt
+    import traceback
+
+    import numpy as np
+
+    import contacts as ct
+    import store
+
+    now = lambda: dt.datetime.now(dt.UTC).isoformat()  # noqa: E731
+    claimed = store.update("jobs", {"status": "running", "started_at": now(), "progress": 0.05}, id=f"eq.{job_id}", status="eq.queued")
+    if not claimed:
+        return
+    job = claimed[0]
+    store.update("jobs", {"attempts": job["attempts"] + 1}, id=f"eq.{job_id}")
+    clip_id = job["clip_id"]
+    try:
+        clip = store.select("clips", id=f"eq.{clip_id}", select="player_id,player:players!clips_player_id_fkey(handedness)")[0]
+        hand = (clip.get("player") or {}).get("handedness")
+        rallies = store.select("rallies", clip_id=f"eq.{clip_id}", status="eq.ready", pose_key="not.is.null",
+                               select="id,pose_key,calibration_id", order="start_frame")
+        cals = {c["id"]: np.array(c["homography"], float) for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,homography")}
+        results = {}
+        for i, r in enumerate(rallies):
+            results[r["id"]] = save_contacts(r["id"], clip["player_id"], store.get_bytes(r["pose_key"]), cals[r["calibration_id"]], hand)
+            store.update("jobs", {"progress": round(0.05 + 0.95 * (i + 1) / len(rallies), 3)}, id=f"eq.{job_id}")
+        store.update("jobs", {"status": "done", "progress": 1, "finished_at": now(), "error": None,
+                              "versions": {"contacts": ct.RULES_VERSION, "rallies": results}}, id=f"eq.{job_id}")
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        store.update("jobs", {"status": "failed", "error": f"{type(e).__name__}: {e}"[:500], "finished_at": now()}, id=f"eq.{job_id}")
 
 
 @app.function(image=gpu_image, gpu="T4", timeout=600, volumes={"/models": models})
@@ -411,7 +476,7 @@ def gpu_check() -> dict:
     return result
 
 
-RUNNERS = {"prescan": prescan, "sidecheck": sidecheck, "analyse": analyse}
+RUNNERS = {"prescan": prescan, "sidecheck": sidecheck, "analyse": analyse, "reanalyse": reanalyse}
 
 
 # --- Starting jobs ------------------------------------------------------------------------------
@@ -458,7 +523,7 @@ def sweep() -> None:
         store.update("jobs", {"status": "failed", "error": "Timed out", "finished_at": now.isoformat()}, id=f"eq.{job['id']}")
         if job["type"] == "prescan":
             store.update("clips", {"status": "failed", "error": "Finding the rallies took too long. Retry."}, id=f"eq.{job['clip_id']}")
-        elif job["type"] in ("analyse", "reanalyse"):
+        elif job["type"] == "analyse":
             store.update("rallies", {"status": "failed"}, clip_id=f"eq.{job['clip_id']}", status="in.(queued,analysing)")
             store.update("clips", {"status": "failed", "error": "Analysing the rallies took too long. Retry."}, id=f"eq.{job['clip_id']}")
 
@@ -497,6 +562,17 @@ def analyse_now(clip_id: str):
     """Re-analyses one clip's rallies by hand, waiting for it to finish."""
     job_id = requeue_analysis.remote(clip_id)
     analyse.remote(job_id)
+    summary = job_summary.remote(job_id)
+    print({k: summary["job"][k] for k in ("status", "error")})
+    for rid, stats in (summary["job"]["versions"] or {}).get("rallies", {}).items():
+        print(rid[:8], stats)
+
+
+@app.local_entrypoint()
+def reanalyse_now(clip_id: str):
+    """Re-runs contacts and zones for one clip from its stored pose files, waiting for it to finish."""
+    job_id = queue_job.remote(clip_id, "reanalyse")
+    reanalyse.remote(job_id)
     summary = job_summary.remote(job_id)
     print({k: summary["job"][k] for k in ("status", "error")})
     for rid, stats in (summary["job"]["versions"] or {}).get("rallies", {}).items():

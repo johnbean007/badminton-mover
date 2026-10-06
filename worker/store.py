@@ -32,6 +32,10 @@ def upload(path: str, key: str, content_type: str) -> None:
     _r2().upload_file(path, _bucket(), key, ExtraArgs={"ContentType": content_type})
 
 
+def get_bytes(key: str) -> bytes:
+    return _r2().get_object(Bucket=_bucket(), Key=key)["Body"].read()
+
+
 def put_bytes(data: bytes, key: str, content_type: str) -> None:
     _r2().put_object(Bucket=_bucket(), Key=key, Body=data, ContentType=content_type)
 
@@ -66,6 +70,12 @@ def update(table: str, values: dict, **filters: str) -> list[dict]:
 def insert(table: str, rows: list[dict]) -> None:
     if rows:
         _db().post(f"/{table}", json=rows).raise_for_status()
+
+
+def _insert_returning(table: str, row: dict) -> dict:
+    r = _db().post(f"/{table}", json=row, headers={"Prefer": "return=representation"})
+    r.raise_for_status()
+    return r.json()[0]
 
 
 def remove(table: str, **filters: str) -> list[dict]:

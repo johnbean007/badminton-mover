@@ -9,6 +9,7 @@ import unittest
 import numpy as np
 
 import analyse as an
+import contacts as ct
 
 
 class GapFilling(unittest.TestCase):
@@ -87,6 +88,33 @@ class Hits(unittest.TestCase):
         hits = an.find_hits(near_kp, conf, np.ones(T, bool), far_box, far_kp, conf.copy(), xy, fps, px=720 / an.TUNED_HEIGHT)
         self.assertEqual([h["index"] for h in hits], [30, 60, 90, 120])
         self.assertEqual([h["hitter"] for h in hits], ["player", "opponent", "player", "opponent"])
+
+
+class Contacts(unittest.TestCase):
+    def test_zones_follow_handedness_and_flag_out_of_court(self):
+        self.assertEqual(ct.zone_of(1.5, 1.0, "R"), ("Front FH", False))
+        self.assertEqual(ct.zone_of(1.5, 1.0, "L"), ("Front BH", False))
+        self.assertEqual(ct.zone_of(0.0, 3.0, "L"), ("Base", False))
+        self.assertEqual(ct.zone_of(-1.5, 6.0, "L"), ("Rear FH", False))
+        self.assertEqual(ct.zone_of(-3.0, 6.0, "R"), ("Rear BH", True))  # beyond the singles sideline
+
+    def test_plants_found_between_strides(self):
+        """The left foot is on one spot for frames 9-24 and 39-54 and moves in between; the right never stops."""
+        fps, T = 30.0, 70
+        kp = np.zeros((T, an.N_KP, 2))
+        kp[:, :, 1] = np.linspace(0.3, 0.6, an.N_KP)  # a standing figure 0.3 of the frame tall
+        kp[:, :, 0] = 0.5
+        x = np.zeros(T)
+        for t in range(1, T):
+            x[t] = x[t - 1] + (0 if 10 <= t <= 24 or 40 <= t <= 54 else 0.02)
+        for i in (15, 17, 19):
+            kp[:, i, 0] += x
+        for i in (16, 20, 22):
+            kp[:, i, 0] += 0.015 * np.arange(T)
+        conf = np.ones((T, an.N_KP))
+        H = np.eye(3)
+        found = ct.detect(kp, conf, fps, 100, H, "R")
+        self.assertEqual([(c["foot"], c["start_frame"], c["end_frame"]) for c in found], [("L", 109, 124), ("L", 139, 154)])
 
 
 if __name__ == "__main__":

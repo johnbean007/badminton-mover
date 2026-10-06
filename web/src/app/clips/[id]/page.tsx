@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import { AppHeader } from "@/components/app-header";
 import { requireMember } from "@/lib/auth";
 import { type ClipStatus, STATUS_LABELS } from "@/lib/clips";
+import type { Pt } from "@/lib/court";
 import { signDownload } from "@/lib/r2";
 import { createClient } from "@/lib/supabase/server";
 
@@ -34,7 +35,7 @@ export default async function ViewerPage({ params, searchParams }: PageProps<"/c
 
   const { data: rallyRows } = await supabase
     .from("rallies")
-    .select("id, start_frame, end_frame, status")
+    .select("id, start_frame, end_frame, status, calibration_id")
     .eq("clip_id", id)
     .in("status", ["queued", "analysing", "ready", "failed"])
     .order("start_frame");
@@ -98,11 +99,21 @@ export default async function ViewerPage({ params, searchParams }: PageProps<"/c
     );
   }
 
-  const [{ data: hits }, videoUrl, overlayUrl] = await Promise.all([
+  const [{ data: hits }, { data: subjects }, { data: calibration }, videoUrl, overlayUrl] = await Promise.all([
     supabase.from("shuttle_hits").select("id, frame, hitter, confidence").eq("rally_id", rally.id).eq("deleted", false).order("frame"),
+    supabase.from("rally_subjects").select("id").eq("rally_id", rally.id).eq("side", "near").limit(1),
+    rally.calibration_id ? supabase.from("calibrations").select("corners").eq("id", rally.calibration_id).maybeSingle() : Promise.resolve({ data: null }),
     signDownload(clip.playback_key, 6 * 3600),
     signDownload(`overlay/${rally.id}.json`, 6 * 3600),
   ]);
+  const { data: contacts } = subjects?.length
+    ? await supabase
+        .from("contacts")
+        .select("id, foot, start_frame, end_frame, zone, out_of_court, confidence, court_x_m, court_y_m")
+        .eq("subject_id", subjects[0].id)
+        .eq("deleted", false)
+        .order("start_frame")
+    : { data: [] };
 
   return (
     <>
@@ -138,6 +149,16 @@ export default async function ViewerPage({ params, searchParams }: PageProps<"/c
           start={rally.start_frame}
           end={rally.end_frame}
           hits={(hits ?? []).map((h) => ({ id: h.id, frame: h.frame, hitter: h.hitter as "player" | "opponent", confidence: h.confidence === null ? null : Number(h.confidence) }))}
+          contacts={(contacts ?? []).map((c) => ({
+            id: c.id,
+            foot: c.foot as "L" | "R",
+            start: c.start_frame,
+            end: c.end_frame,
+            zone: c.zone,
+            out: c.out_of_court,
+            confidence: c.confidence === null ? null : Number(c.confidence),
+          }))}
+          corners={(calibration?.corners as Pt[] | undefined) ?? null}
         />
       </main>
     </>

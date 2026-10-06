@@ -1,13 +1,27 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { courtToFrame, type Mat3, project, type Pt } from "@/lib/court";
 
 // overlay/{rally_id}.json, written by the worker: per frame from `start`, the tracked player's 23
 // keypoints as [x, y, confidence, …] (x, y in 1/10000ths of the frame, confidence in hundredths)
 // and the shuttle as [x, y], or null where nothing was found.
 type Overlay = { v: 1; fps: number; start: number; kp: (number[] | null)[]; shuttle: ([number, number] | null)[] };
 export type Hit = { id: string; frame: number; hitter: "player" | "opponent"; confidence: number | null };
-type Props = { videoUrl: string; overlayUrl: string; fps: number; start: number; end: number; hits: Hit[] };
+export type Contact = { id: string; foot: "L" | "R"; start: number; end: number; zone: string | null; out: boolean; confidence: number | null };
+type Props = {
+  videoUrl: string;
+  overlayUrl: string;
+  fps: number;
+  start: number;
+  end: number;
+  hits: Hit[];
+  contacts: Contact[];
+  corners: Pt[] | null; // the court calibration (outer corners, frame fractions), for the zone grid
+};
+// Which feet are planted at each frame of the rally: bit 1 = left, bit 2 = right.
+type Planted = Uint8Array;
 
 const SPEEDS = [0.1, 0.25, 0.5, 1];
 const KP_MIN = 0.3;
@@ -25,13 +39,41 @@ const BONES: [number, number][] = [
   [11, 13], [13, 15], [15, 19], [15, 17], [17, 18], [19, 17], [12, 14], [14, 16], [16, 22], [16, 20], [20, 21], [22, 20],
 ];
 
+const LOW_CONFIDENCE = 0.6;
+// The nine zones of the near half (court metres: x across, y from the net), matching the worker.
+const SINGLES = 2.59;
+const COLUMN = (2 * SINGLES) / 3;
+const ROWS = [0, 2.0, 4.6, 6.7];
+
 const side = (i: number) => (LEFT.has(i) ? C_LEFT : RIGHT.has(i) ? C_RIGHT : C_MID);
 
-function drawOverlay(ctx: CanvasRenderingContext2D, data: Overlay, frame: number, w: number, h: number, dpr: number) {
+function drawZones(ctx: CanvasRenderingContext2D, H: Mat3, w: number, h: number, dpr: number) {
+  const P = (x: number, y: number) => {
+    const [u, v] = project(H, [x, y]);
+    return [u * w, v * h] as const;
+  };
+  const line = (a: readonly [number, number], b: readonly [number, number]) => {
+    ctx.beginPath();
+    ctx.moveTo(...a);
+    ctx.lineTo(...b);
+    ctx.stroke();
+  };
+  ctx.save();
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+  ctx.lineWidth = 1.5 * dpr;
+  ctx.setLineDash([6 * dpr, 5 * dpr]);
+  for (const x of [-SINGLES, -COLUMN / 2, COLUMN / 2, SINGLES]) line(P(x, 0), P(x, 6.7));
+  for (const y of ROWS) line(P(-SINGLES, y), P(SINGLES, y));
+  ctx.restore();
+}
+
+function drawOverlay(ctx: CanvasRenderingContext2D, data: Overlay, frame: number, w: number, h: number, dpr: number, planted: Planted | null, zones: Mat3 | null) {
   ctx.clearRect(0, 0, w, h);
+  if (zones) drawZones(ctx, zones, w, h, dpr);
   const t = frame - data.start;
   const X = (v: number) => (v / 10000) * w;
   const Y = (v: number) => (v / 10000) * h;
+  const down = planted && t >= 0 && t < planted.length ? planted[t] : 0;
 
   // Shuttle: a fading trail over the last 0.4 s, and a ring where it is now. No ring where it wasn't found.
   const trail = Math.round(TRAIL_S * data.fps);
@@ -78,8 +120,8 @@ function drawOverlay(ctx: CanvasRenderingContext2D, data: Overlay, frame: number
     ctx.globalAlpha = ok(i) ? 1 : 0.3;
     ctx.beginPath();
     ctx.arc(px(i), py(i), (foot ? 5 : 3) * dpr, 0, 2 * Math.PI);
-    if (foot) {
-      // Outlined until foot contacts arrive (milestone 5), which fill a planted foot.
+    if (foot && !(down & (LEFT.has(i) ? 1 : 2))) {
+      // A foot in the air is an outline; a planted foot is filled.
       ctx.strokeStyle = side(i);
       ctx.lineWidth = 2 * dpr;
       ctx.stroke();
@@ -91,7 +133,7 @@ function drawOverlay(ctx: CanvasRenderingContext2D, data: Overlay, frame: number
   ctx.globalAlpha = 1;
 }
 
-export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits }: Props) {
+export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, contacts, corners }: Props) {
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const data = useRef<Overlay | null>(null);
@@ -103,6 +145,14 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits }: Pro
   const [playing, setPlaying] = useState(false);
   const [rate, setRate] = useState(1);
   const [size, setSize] = useState<[number, number]>([16, 9]);
+  const [showZones, setShowZones] = useState(false);
+  const zonesRef = useRef<Mat3 | null>(null);
+  const planted = useMemo(() => {
+    const p = new Uint8Array(end - start + 1);
+    for (const c of contacts) for (let f = Math.max(c.start, start); f <= Math.min(c.end, end); f++) p[f - start] |= c.foot === "L" ? 1 : 2;
+    return p;
+  }, [contacts, start, end]);
+  const plantedRef = useRef(planted);
 
   const toFrame = useCallback((seconds: number) => Math.round(seconds * fps), [fps]);
 
@@ -116,7 +166,7 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits }: Pro
       ctx.clearRect(0, 0, c.width, c.height);
       return;
     }
-    drawOverlay(ctx, d, f, c.width, c.height, window.devicePixelRatio || 1);
+    drawOverlay(ctx, d, f, c.width, c.height, window.devicePixelRatio || 1, plantedRef.current, zonesRef.current);
     shown.current = f;
   }, []);
 
@@ -202,6 +252,12 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits }: Pro
     void v.play();
   }, [toFrame, end, seek, start]);
 
+  useEffect(() => {
+    plantedRef.current = planted;
+    zonesRef.current = showZones && corners ? courtToFrame(corners) : null;
+    paint(shown.current >= 0 ? shown.current : start);
+  }, [planted, showZones, corners, paint, start]);
+
   function changeRate(r: number) {
     setRate(r);
     if (video.current) video.current.playbackRate = r;
@@ -230,6 +286,24 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits }: Pro
   const pos = (f: number) => `${((f - start) / span) * 100}%`;
   const secs = (f: number) => ((f - start) / fps).toFixed(2);
   const playerHits = hits.filter((h) => h.hitter === "player").length;
+  const ms = (frames: number) => Math.round((frames / fps) * 1000);
+  // Gap since the previous contact (either foot) ended, for the hover text.
+  const gaps = new Map<string, number>();
+  let lastEnd: number | null = null;
+  for (const c of [...contacts].sort((a, b) => a.start - b.start)) {
+    if (lastEnd !== null) gaps.set(c.id, c.start - lastEnd - 1);
+    lastEnd = Math.max(lastEnd ?? c.end, c.end);
+  }
+  const current = contacts.filter((c) => c.start <= frame && frame <= c.end);
+  const contactTitle = (c: Contact) =>
+    [
+      `${c.foot === "L" ? "Left" : "Right"} foot · ${c.zone ?? "no zone"}${c.out ? " (out of court)" : ""}`,
+      `${secs(c.start)}–${secs(c.end)} s · ${ms(c.end - c.start + 1)} ms down`,
+      gaps.has(c.id) ? `${ms(gaps.get(c.id)!)} ms after the previous contact` : "first contact",
+      c.confidence !== null ? `confidence ${Math.round(c.confidence * 100)}%` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
 
   return (
     <div className="viewer">
@@ -271,6 +345,11 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits }: Pro
           {secs(frame)} s / {secs(end)} s · frame {frame}
         </span>
         <div className="spacer" />
+        {corners ? (
+          <label className="small muted toggle">
+            <input type="checkbox" checked={showZones} onChange={(e) => setShowZones(e.target.checked)} /> Show zones
+          </label>
+        ) : null}
         <div className="speeds" role="group" aria-label="Playback speed">
           {SPEEDS.map((s) => (
             <button key={s} type="button" className={`btn small ${rate === s ? "primary" : ""}`} aria-pressed={rate === s} onClick={() => changeRate(s)}>
@@ -308,8 +387,27 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits }: Pro
             <span className="playhead" style={{ left: pos(frame) }} />
           </div>
         </div>
+        {(["L", "R"] as const).map((foot) => (
+          <div className="lane" key={foot}>
+            <span className="lane-label small muted">{foot === "L" ? "Left foot" : "Right foot"}</span>
+            <div className="lane-track">
+              {contacts
+                .filter((c) => c.foot === foot)
+                .map((c) => (
+                  <span
+                    key={c.id}
+                    className={`contact ${foot} ${c.confidence !== null && c.confidence < LOW_CONFIDENCE ? "low" : ""} ${current.includes(c) ? "now" : ""}`}
+                    style={{ left: pos(c.start), width: `max(3px, ${((c.end - c.start + 1) / span) * 100}%)` }}
+                    title={contactTitle(c)}
+                  />
+                ))}
+              <span className="playhead" style={{ left: pos(frame) }} />
+            </div>
+          </div>
+        ))}
         <p className="small muted lane-note">
-          {hits.length} hits ({playerHits} by the player). Left and right foot lanes arrive with step detection.
+          {hits.length} hits ({playerHits} by the player) · {contacts.length} foot contacts
+          {current.length ? ` · now: ${current.map((c) => `${c.foot} in ${c.zone ?? "?"}${c.out ? " (out)" : ""}`).join(", ")}` : ""}
         </p>
       </div>
 

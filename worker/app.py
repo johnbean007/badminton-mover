@@ -9,7 +9,8 @@ trigger call got lost.
     .venv/bin/modal run app.py::prescan_now --clip-id <uuid>   # pre-scan one clip by hand
     .venv/bin/modal run app.py::gpu_check                      # pose and shuttle models load on the GPU
     .venv/bin/modal run app.py::analyse_now --clip-id <uuid>   # (re-)analyse a clip's chosen rallies
-    .venv/bin/modal run app.py::reanalyse_now --clip-id <uuid> # re-run contacts and zones from stored pose
+    .venv/bin/modal run app.py::reanalyse_now --clip-id <uuid> # re-run contacts, zones and movements from stored pose
+    .venv/bin/modal run app.py::pull_now --clip-id <uuid>      # copy stored pose and hits to data/ for local work
 
 The shuttle tracker's checkpoints live in the Modal volume badminton-mover-models, put there once with
     .venv/bin/modal volume put badminton-mover-models ../spike/vendor/TrackNetV3/ckpts/TrackNet_best.pt /tracknet/
@@ -38,7 +39,8 @@ base = modal.Image.debian_slim(python_version="3.12")
 cpu_deps = base.apt_install("ffmpeg").pip_install(
     "boto3", "httpx", "numpy>=2", "opencv-python-headless>=4.10", "scenedetect>=0.6.6", "fastapi[standard]"
 )
-cpu_image = cpu_deps.add_local_python_source("prescan", "store", "contacts", "courtfit")
+cpu_image = cpu_deps.add_local_python_source("prescan", "store", "contacts", "courtfit", "movements").add_local_file(
+    "movement_rules.toml", "/root/movement_rules.toml")
 # Person detector for the near-side check, baked into the image so jobs don't download it.
 detect_image = (
     cpu_deps.apt_install("libgl1", "libglib2.0-0")
@@ -67,7 +69,8 @@ gpu_image = (
     .pip_install("boto3", "httpx", "numpy>=2", "pillow", "rtmlib")
     .run_commands("pip uninstall -y onnxruntime", "pip install onnxruntime-gpu")
     .run_function(fetch_pose_models)
-    .add_local_python_source("store", "analyse", "tracknet", "tracknet_model", "contacts", "courtfit")
+    .add_local_python_source("store", "analyse", "tracknet", "tracknet_model", "contacts", "courtfit", "movements")
+    .add_local_file("movement_rules.toml", "/root/movement_rules.toml")
 )
 
 
@@ -304,19 +307,36 @@ def check_court(path: str, clip_id: str, rally: dict, cal: dict):
     return H, fit
 
 
-def save_contacts(rally_id: str, player_id: str, pose_bytes: bytes, H, hand: str | None) -> dict:
-    """Foot contacts and zones from a rally's pose file. Replaces the rule-made contacts; contacts
-    members added or corrected stay."""
+def save_labels(rally_id: str, player_id: str, pose_bytes: bytes, H, hand: str | None) -> dict:
+    """Foot contacts, zones and movement labels from a rally's pose file and shuttle hits. Replaces the
+    rule-made rows; rows members added or corrected stay."""
+    import uuid
+
     import contacts as ct
+    import movements as mv
     import store
 
     pose = ct.load_pose(pose_bytes)
-    found = ct.detect(pose["kp"], pose["conf"], pose["meta"]["fps"], int(pose["frame"][0]), H, hand)
+    fps, first = pose["meta"]["fps"], int(pose["frame"][0])
+    found = ct.detect(pose["kp"], pose["conf"], fps, first, H, hand)
+    hits = store.select("shuttle_hits", rally_id=f"eq.{rally_id}", deleted="eq.false", select="frame,hitter")
+    rules = mv.load_rules()
+    moves = mv.label(pose["kp"], pose["conf"], fps, first, found, hits, H, hand, rules, pose["meta"]["width"], pose["meta"]["height"])
+
     sid = subject_id(rally_id, player_id)
+    store.remove("movements", subject_id=f"eq.{sid}", source="eq.rules")
     store.remove("contacts", subject_id=f"eq.{sid}", source="eq.rules")
-    store.insert("contacts", [{**{k: v for k, v in c.items() if k != "image_xy"}, "subject_id": sid, "rules_version": ct.RULES_VERSION}
-                              for c in found])
-    return ct.summary(found, len(pose["kp"]), pose["meta"]["fps"])
+    ids = [str(uuid.uuid4()) for _ in found]
+    store.insert("contacts", [{**{k: v for k, v in c.items() if k != "image_xy"}, "id": i, "subject_id": sid, "rules_version": ct.RULES_VERSION}
+                              for i, c in zip(ids, found)])
+    rows, links = [], []
+    for m in moves:
+        mid = str(uuid.uuid4())
+        rows.append({**{k: v for k, v in m.items() if k != "contacts"}, "id": mid, "subject_id": sid, "rules_version": rules["rules_version"]})
+        links += [{"movement_id": mid, "contact_id": ids[i]} for i in m["contacts"]]
+    store.insert("movements", rows)
+    store.insert("movement_contacts", links)
+    return {**ct.summary(found, len(pose["kp"]), fps), "movements": mv.summary(moves, len(found))}
 
 
 def gpu_models():
@@ -422,7 +442,7 @@ def analyse(job_id: str) -> None:
                                                    "confidence": h["confidence"]} for h in res.hits])
                     stats = res.stats
                     H, stats["court_fit"] = check_court(path, clip_id, r, cal_rows[r["calibration_id"]])
-                    stats["contacts"] = save_contacts(rid, clip["player_id"], pose_bytes, H, hand)
+                    stats["labels"] = save_labels(rid, clip["player_id"], pose_bytes, H, hand)
                     store.update("rallies", {**keys, "status": "ready"}, id=f"eq.{rid}")
                     results[rid] = stats
                     done += 1
@@ -449,7 +469,7 @@ def analyse(job_id: str) -> None:
 @app.function(image=cpu_image, secrets=secrets, cpu=2, memory=4096, timeout=15 * 60)
 def reanalyse(job_id: str) -> None:
     """Re-runs the later stages from the stored pose files: the court fit (after a recalibration),
-    then contacts and zones. Seconds on a CPU instead of tracking the pose again; the clip stays
+    then contacts, zones and movement labels. Seconds on a CPU instead of tracking the pose again; the clip stays
     viewable throughout."""
     import datetime as dt
     import os
@@ -460,6 +480,7 @@ def reanalyse(job_id: str) -> None:
 
     import contacts as ct
     import courtfit as cf
+    import movements as mv
     import store
 
     now = lambda: dt.datetime.now(dt.UTC).isoformat()  # noqa: E731
@@ -481,10 +502,11 @@ def reanalyse(job_id: str) -> None:
             store.download(clip["playback_key"], path)
             for i, r in enumerate(rallies):
                 H, fit = check_court(path, clip_id, r, cals[r["calibration_id"]])
-                results[r["id"]] = {"court_fit": fit, **save_contacts(r["id"], clip["player_id"], store.get_bytes(r["pose_key"]), H, hand)}
+                results[r["id"]] = {"court_fit": fit, **save_labels(r["id"], clip["player_id"], store.get_bytes(r["pose_key"]), H, hand)}
                 store.update("jobs", {"progress": round(0.05 + 0.95 * (i + 1) / len(rallies), 3)}, id=f"eq.{job_id}")
         store.update("jobs", {"status": "done", "progress": 1, "finished_at": now(), "error": None,
-                              "versions": {"contacts": ct.RULES_VERSION, "court_fit_ok": cf.FIT_OK, "rallies": results}}, id=f"eq.{job_id}")
+                              "versions": {"contacts": ct.RULES_VERSION, "movements": mv.load_rules()["rules_version"], "court_fit_ok": cf.FIT_OK,
+                                           "rallies": results}}, id=f"eq.{job_id}")
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         store.update("jobs", {"status": "failed", "error": f"{type(e).__name__}: {e}"[:500], "finished_at": now()}, id=f"eq.{job_id}")
@@ -607,13 +629,48 @@ def analyse_now(clip_id: str):
 
 @app.local_entrypoint()
 def reanalyse_now(clip_id: str):
-    """Re-runs contacts and zones for one clip from its stored pose files, waiting for it to finish."""
+    """Re-runs contacts, zones and movements for one clip from its stored pose files, waiting for it to finish."""
     job_id = queue_job.remote(clip_id, "reanalyse")
     reanalyse.remote(job_id)
     summary = job_summary.remote(job_id)
     print({k: summary["job"][k] for k in ("status", "error")})
     for rid, stats in (summary["job"]["versions"] or {}).get("rallies", {}).items():
         print(rid[:8], stats)
+
+
+@app.function(image=cpu_image, secrets=secrets, timeout=600)
+def rally_data(clip_id: str, with_video: bool) -> dict:
+    """A clip's analysed rallies with what the later stages read (pose, hits, calibration), for local work."""
+    import store
+
+    clip = store.select("clips", id=f"eq.{clip_id}", select="fps,playback_key,player_id,player:players!clips_player_id_fkey(handedness)")[0]
+    rallies = store.select("rallies", clip_id=f"eq.{clip_id}", status="eq.ready", pose_key="not.is.null",
+                           select="id,index,start_frame,end_frame,pose_key,calibration_id", order="start_frame")
+    cals = {c["id"]: c["homography"] for c in store.select("calibrations", clip_id=f"eq.{clip_id}", select="id,homography")}
+    out = []
+    for r in rallies:
+        hits = store.select("shuttle_hits", rally_id=f"eq.{r['id']}", deleted="eq.false", select="frame,hitter,confidence", order="frame")
+        out.append({**r, "homography": cals[r["calibration_id"]], "hits": hits, "pose": store.get_bytes(r["pose_key"])})
+    video = store.get_bytes(clip["playback_key"]) if with_video else None
+    return {"fps": clip["fps"], "hand": (clip.get("player") or {}).get("handedness"), "rallies": out, "video": video}
+
+
+@app.local_entrypoint()
+def pull_now(clip_id: str, out: str = "data", video: bool = False):
+    """Copies a clip's stored pose, hits and calibrations (and with --video, its playback copy) to
+    data/<clip_id>/ for local work on the later stages. The folder is gitignored."""
+    import json
+    from pathlib import Path
+
+    d = rally_data.remote(clip_id, video)
+    folder = Path(out) / clip_id
+    folder.mkdir(parents=True, exist_ok=True)
+    for r in d["rallies"]:
+        (folder / f"{r['id']}.npz").write_bytes(r.pop("pose"))
+    if d["video"]:
+        (folder / "playback.mp4").write_bytes(d["video"])
+    (folder / "clip.json").write_text(json.dumps({"fps": d["fps"], "hand": d["hand"], "rallies": d["rallies"]}, indent=1))
+    print(f"{len(d['rallies'])} rallies → {folder}")
 
 
 @app.local_entrypoint()

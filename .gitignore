@@ -23,3 +23,6 @@ spike/out/
 # Third-party code and model checkpoints for the spike
 spike/vendor/
 *.pt
+
+# Local copies of stored analysis data (worker pull_now)
+worker/data/

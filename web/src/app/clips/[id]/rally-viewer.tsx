@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CORNER_NAMES, COURT_FIT_OK, COURT_LINES, checkCorners, clickModel, courtToFrame, homography, type Mat3, NET_LINE, type NearPoints, project, type Pt } from "@/lib/court";
+import { type Movement, movementLabels, movementText } from "@/lib/movements";
 
 import { recalibrateRally } from "./actions";
 
@@ -21,6 +22,7 @@ type Props = {
   end: number;
   hits: Hit[];
   contacts: Contact[];
+  movements: Movement[];
   corners: Pt[] | null; // the court calibration (outer corners, frame fractions), for the zone grid
   courtFit: number | null; // how well that calibration matches this rally's camera view (worker's score)
   clipId: string;
@@ -52,6 +54,32 @@ const LOW_CONFIDENCE = 0.6;
 const SINGLES = 2.59;
 const COLUMN = (2 * SINGLES) / 3;
 const ROWS = [0, 2.0, 4.6, 6.7];
+
+// What a movement's rule measured, for its hover text (keys from worker/movements.py).
+const DETAILS: [string, string, string][] = [
+  ["stride_m", "stride", "m"],
+  ["travel_m", "travel", "m"],
+  ["flight_s", "in the air", "s"],
+  ["hip_lift", "hip lift", "heights"],
+  ["turn_deg", "turn", "°"],
+  ["after_opponent_hit_s", "after opponent's hit", "s"],
+  ["closer_m", "closer to Base", "m"],
+];
+const CHIP_ROW = 22; // px
+const CHAR_PX = 6.6; // average width of a character in a chip at 12px
+
+/** Rows for chips so overlapping movements don't cover each other: each goes in the first row it fits. */
+function chipRows(movements: Movement[]) {
+  const ends: number[] = [];
+  const rows = new Map<string, number>();
+  for (const m of [...movements].sort((a, b) => a.start - b.start)) {
+    let row = ends.findIndex((e) => e < m.start);
+    if (row < 0) row = ends.push(-1) - 1;
+    ends[row] = m.end;
+    rows.set(m.id, row);
+  }
+  return { rows, count: Math.max(1, ends.length) };
+}
 
 const side = (i: number) => (LEFT.has(i) ? C_LEFT : RIGHT.has(i) ? C_RIGHT : C_MID);
 
@@ -177,7 +205,7 @@ function drawOverlay(ctx: CanvasRenderingContext2D, data: Overlay, frame: number
   ctx.globalAlpha = 1;
 }
 
-export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, contacts, corners, courtFit, clipId, rallyId, canEdit, updating }: Props) {
+export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, contacts, movements, corners, courtFit, clipId, rallyId, canEdit, updating }: Props) {
   const router = useRouter();
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -198,6 +226,17 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
     return p;
   }, [contacts, start, end]);
   const plantedRef = useRef(planted);
+  const { rows: stepRows, count: stepRowCount } = useMemo(() => chipRows(movements), [movements]);
+  // The steps lane's width in pixels, to choose how much of each chip's label fits.
+  const stepsTrack = useRef<HTMLDivElement>(null);
+  const [trackPx, setTrackPx] = useState(800);
+  useEffect(() => {
+    const el = stepsTrack.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setTrackPx(el.clientWidth));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const [calibrating, setCalibrating] = useState(false);
   const [draft, setDraft] = useState<Pt[]>([]);
   const draftRef = useRef<Pt[] | null>(null);
@@ -390,6 +429,19 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
     lastEnd = Math.max(lastEnd ?? c.end, c.end);
   }
   const current = contacts.filter((c) => c.start <= frame && frame <= c.end);
+  const step = [...movements].reverse().find((m) => m.start <= frame && frame <= m.end) ?? null;
+  const pct = (v: number | null) => (v !== null ? `confidence ${Math.round(v * 100)}%` : "");
+  const stepTitle = (m: Movement) =>
+    [
+      movementText(m),
+      `${secs(m.start)}–${secs(m.end)} s`,
+      DETAILS.filter(([k]) => typeof m.details?.[k] === "number")
+        .map(([k, name, unit]) => `${name} ${(m.details![k] as number).toFixed(unit === "°" ? 0 : 2)}${unit === "°" ? "°" : ` ${unit}`}`)
+        .join(" · "),
+      pct(m.confidence),
+    ]
+      .filter(Boolean)
+      .join("\n");
   const contactTitle = (c: Contact) =>
     [
       `${c.foot === "L" ? "Left" : "Right"} foot · ${c.zone ?? "no zone"}${c.out ? " (out of court)" : ""}`,
@@ -527,6 +579,26 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
 
       <div className="timeline panel">
         <div className="lane">
+          <span className="lane-label small muted">Steps</span>
+          <div className="lane-track steps" ref={stepsTrack} style={{ height: stepRowCount * CHIP_ROW + 4 }}>
+            {movements.map((m) => {
+              const width = ((m.end - m.start + 1) / span) * trackPx;
+              const label = movementLabels(m).find((l) => l.length * CHAR_PX + 10 <= width) ?? "";
+              return (
+                <span
+                  key={m.id}
+                  className={`step ${m.confidence !== null && m.confidence < LOW_CONFIDENCE ? "low" : ""} ${m === step ? "now" : ""}`}
+                  style={{ left: pos(m.start), width: `max(6px, ${((m.end - m.start + 1) / span) * 100}%)`, top: 2 + (stepRows.get(m.id) ?? 0) * CHIP_ROW }}
+                  title={stepTitle(m)}
+                >
+                  {label}
+                </span>
+              );
+            })}
+            <span className="playhead" style={{ left: pos(frame) }} />
+          </div>
+        </div>
+        <div className="lane">
           <span className="lane-label small muted">Shuttle</span>
           <div className="lane-track">
             {hits.map((h) => (
@@ -559,7 +631,8 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
           </div>
         ))}
         <p className="small muted lane-note">
-          {hits.length} hits ({playerHits} by the player) · {contacts.length} foot contacts
+          {hits.length} hits ({playerHits} by the player) · {contacts.length} foot contacts · {movements.length} steps
+          {step ? ` · step: ${movementText(step)}${step.confidence !== null && step.confidence < LOW_CONFIDENCE ? " (unsure)" : ""}` : ""}
           {current.length ? ` · now: ${current.map((c) => `${c.foot} in ${c.zone ?? "?"}${c.out ? " (out)" : ""}`).join(", ")}` : ""}
         </p>
       </div>
@@ -579,6 +652,9 @@ export function RallyViewer({ videoUrl, overlayUrl, fps, start, end, hits, conta
         </span>
         <span>
           <i className="diamond" /> Opponent hit
+        </span>
+        <span>
+          <i className="dashed" /> Unsure label
         </span>
         <span>Space plays, arrows step a frame (Shift: a second).</span>
       </div>

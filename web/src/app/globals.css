@@ -230,6 +230,11 @@ textarea.input { resize: vertical; font: inherit; }
 .contact.R { background: #f08a24; }
 .contact.low { opacity: .55; border: 1.5px dashed var(--ink); }
 .contact.now { box-shadow: 0 0 0 2px var(--ink); }
+.step { position: absolute; height: 18px; padding: 0 5px; border-radius: 4px; border: 1.5px solid var(--accent); background: var(--accent-soft); color: var(--ink);
+  font-size: 12px; line-height: 15px; white-space: nowrap; overflow: hidden; box-sizing: border-box; }
+.step.low { border-style: dashed; border-color: var(--ink-2); background: var(--surface); color: var(--ink-2); }
+.step.now { box-shadow: 0 0 0 2px var(--ink); }
+.legend i.dashed { width: 14px; height: 10px; border: 1.5px dashed var(--ink-2); border-radius: 3px; background: none; }
 .toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
 .viewer canvas.overlay.picking { pointer-events: auto; cursor: crosshair; }
 .notice:not(.good):not(.bad):not(.warn) { background: var(--surface-2); color: var(--ink-2); }

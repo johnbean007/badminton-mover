@@ -1,0 +1,83 @@
+# Movement rules (milestone 6): the order the rules are tried in and every threshold they use.
+# Tune here, not in movements.py. Re-label a clip from its stored pose after a change with
+#     .venv/bin/modal run app.py::reanalyse_now --clip-id <uuid>
+# Bump `version` when the meaning of a label changes; rows also record a hash of this file, so
+# every label can be traced to the exact settings that made it.
+#
+# Units: seconds, court metres (x across, positive to the player's right; y from the net, 0, to
+# the near baseline, 6.7), player heights (the tracked player's height on screen), degrees.
+# A rule passes when every condition passes; its confidence is how far the closest call cleared its
+# threshold (soft margins below), times how clearly the feet were seen.
+
+version = "movements-1"
+
+# First matching rule wins. Two-foot rules (the jumps, split step) look at a pair of landings;
+# the rest at one foot's contact.
+order = ["scissor_jump", "jump", "split_step", "lunge", "hitting_step", "pivot", "recovery_step", "running_step", "cross_step", "chasse"]
+
+[common]
+pair_s = 0.08           # two feet land (or take off) "together" when this close in time
+hit_tolerance_s = 0.10  # a hit belongs to a contact (or a flight) when within this of it
+min_travel_m = 0.25     # a foot moving less than this between plants is an adjustment, left unlabelled
+base = [0.0, 3.3]       # the Base position the player recovers to (centre of the Base zone)
+margin = 0.5            # soft margin for confidence, as a share of each threshold
+
+[scissor_jump]
+# Rear-court jump where the feet swap front-to-back between take-off and landing.
+min_flight_s = 0.12     # both feet off the ground at least this long
+min_swap_m = 0.2        # each foot's front/back lead must be at least this before and after
+min_y_m = 4.0           # landing this far back (rear half of the near court)
+needs_hit = true        # the player hits the shuttle during the flight
+
+[jump]
+# Both feet take off together and land together, with clear vertical hip travel.
+min_flight_s = 0.10
+min_hip_lift = 0.04     # hips rise this far (player heights) above the take-off-to-landing line
+max_takeoff_gap_s = 0.12  # the two feet leave the ground within this of each other
+
+[lunge]
+# The final step of a move towards the net or side: a long stride with the hips dropping.
+min_stride_m = 1.0      # landing foot to the other foot
+max_height_ratio = 0.9  # player's on-screen height at the deepest point / their rally median
+max_knee_deg = 120      # front knee angle (image space); either this or the height drop will do
+max_y_m = 4.6           # not from the rear court (front and mid rows only)
+min_towards_m = 0.3     # the landing foot moved at least this towards the net or the sideline
+
+[hitting_step]
+# The contact at the moment of the player's hit, when it isn't a lunge or a jump. With both
+# feet down, the one that landed last.
+
+[pivot]
+# A contact during which the foot turns (heel-to-toe direction on the court). Measured over the
+# planted part only: at toe-off the heel lifts, which swings the heel-to-toe line without a turn.
+min_turn_deg = 45
+min_contact_s = 0.2     # long enough to turn on
+planted_share = 0.75    # the first 75% of the contact; the rest is toe-off
+min_foot_m = 0.15       # frames where heel-to-toe is shorter (foot pointing at the camera) are skipped
+end_frames = 3          # foot direction averaged over this many usable frames at each end
+
+[split_step]
+# Both feet land together after a small hop, with little travel; usually just after the
+# opponent's hit.
+max_travel_m = 0.5      # stance centre moves less than this...
+timed_max_travel_m = 1.0  # ...or this, when it lands in the window after the opponent's hit (still recovering)
+min_flight_s = 0.0      # the hop can be too quick to see
+after_opponent_s = [-0.15, 0.45]  # landing relative to the opponent's previous hit; outside lowers confidence
+off_timing_confidence = 0.5       # confidence multiplier when it isn't in that window
+
+[recovery_step]
+# A step after the player's hit (before the opponent's next one) that moves them towards Base.
+min_closer_m = 0.15     # stance centre ends at least this much closer to Base
+
+[running_step]
+# Feet passing each other with longer strides, travelling forwards or backwards.
+min_travel_m = 0.6      # the foot moves at least this between its plants
+max_sideways = 0.7      # |cos| of travel to the hip line; above this the move is sideways (cross-step)
+
+[cross_step]
+# One foot passes in front of or behind the other relative to the direction of travel.
+min_pass_m = 0.05       # it starts at least this far behind the other foot and ends this far ahead
+
+[chasse]
+# The feet stay on the same sides relative to the direction of travel: the trailing foot closes
+# up, or the lead foot steps out, without passing.

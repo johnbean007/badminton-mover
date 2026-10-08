@@ -11,6 +11,7 @@ import numpy as np
 import analyse as an
 import contacts as ct
 import courtfit as cf
+import movements as mv
 
 
 class GapFilling(unittest.TestCase):
@@ -146,6 +147,66 @@ class CourtFit(unittest.TestCase):
         self.assertIsNotNone(snapped)
         self.assertGreater(snapped[1], 0.95)
         np.testing.assert_allclose(snapped[0], corners, atol=0.004)
+
+
+class Movements(unittest.TestCase):
+    """Rules over hand-made contact sequences. The pose is a still figure (hips across the court, so
+    sideways = along x) with court metres = 10 × frame fractions."""
+
+    fps, T = 30.0, 120
+    H = np.diag([10.0, 10.0, 1.0])
+
+    def figure(self):
+        kp = np.zeros((self.T, an.N_KP, 2))
+        kp[:, :, 0] = 0.5
+        kp[:, :, 1] = np.linspace(0.2, 0.5, an.N_KP)  # 0.3 of the frame tall
+        kp[:, 11], kp[:, 12] = (0.45, 0.4), (0.55, 0.4)  # left hip, right hip
+        return kp, np.ones((self.T, an.N_KP))
+
+    @staticmethod
+    def contact(foot, start, end, x, y, zone=None):
+        return {"foot": foot, "start_frame": start, "end_frame": end, "court_x_m": x, "court_y_m": y, "zone": zone or "Base", "confidence": 0.9}
+
+    def label(self, contacts, hits=(), kp=None):
+        k, c = self.figure() if kp is None else (kp, np.ones((self.T, an.N_KP)))
+        return mv.label(k, c, self.fps, 0, contacts, list(hits), self.H, "R")
+
+    def test_rules_file_lists_every_type_once(self):
+        rules = mv.load_rules()
+        self.assertEqual(sorted(rules["order"]), sorted(mv.TYPES))
+        self.assertRegex(rules["rules_version"], r"^movements-\d+\+[0-9a-f]{8}$")
+
+    def test_split_step_after_opponent_hit(self):
+        found = self.label([self.contact("L", 0, 20, -0.3, 3.3), self.contact("R", 0, 20, 0.3, 3.3),
+                            self.contact("L", 24, 40, -0.35, 3.3), self.contact("R", 25, 40, 0.35, 3.3)],
+                           hits=[{"frame": 21, "hitter": "opponent"}])
+        self.assertEqual([(m["movement_type"], m["foot"], m["contacts"]) for m in found], [("split_step", "both", [2, 3])])
+        self.assertGreater(found[0]["confidence"], 0.6)
+
+    def test_lunge_beats_hitting_step_and_hitting_step_takes_the_latest_landing(self):
+        kp, _ = self.figure()
+        kp[50:70, :, 1] = np.linspace(0.27, 0.5, an.N_KP)  # hips drop: 0.23 tall instead of 0.3
+        found = self.label([self.contact("L", 0, 70, 0.0, 3.3), self.contact("R", 0, 30, 0.3, 3.3),
+                            self.contact("R", 45, 70, 0.6, 1.5, "Front FH")],
+                           hits=[{"frame": 50, "hitter": "player"}], kp=kp)
+        self.assertEqual([(m["movement_type"], m["foot"], mv.text(m)) for m in found], [("lunge", "R", "Lunge (R) → Front FH")])
+
+        found = self.label([self.contact("L", 0, 70, 0.0, 3.3), self.contact("R", 0, 30, 0.3, 3.3),
+                            self.contact("R", 45, 70, 0.5, 3.0)], hits=[{"frame": 50, "hitter": "player"}])
+        self.assertEqual([(m["movement_type"], m["foot"]) for m in found], [("hitting_step", "R")])
+
+    def test_cross_step_passes_the_other_foot_and_chasse_does_not(self):
+        # Moving to the player's right (along the hip line), the right foot planted at x = 0.3.
+        cross = self.label([self.contact("L", 0, 10, -0.3, 3.3), self.contact("R", 0, 40, 0.3, 3.3), self.contact("L", 20, 40, 0.8, 3.3)])
+        self.assertEqual([m["movement_type"] for m in cross], ["cross_step"])
+        chasse = self.label([self.contact("L", 0, 10, -0.3, 3.3), self.contact("R", 0, 40, 0.3, 3.3), self.contact("L", 20, 40, 0.0, 3.3)])
+        self.assertEqual([m["movement_type"] for m in chasse], ["chasse"])
+
+    def test_scissor_jump_swaps_the_feet_in_the_air(self):
+        found = self.label([self.contact("L", 0, 30, 0.0, 5.8), self.contact("R", 0, 30, 0.4, 5.0),
+                            self.contact("R", 40, 60, 0.4, 6.2, "Rear FH"), self.contact("L", 43, 60, 0.0, 5.2, "Rear C")],
+                           hits=[{"frame": 35, "hitter": "player"}])
+        self.assertEqual([(m["movement_type"], m["foot"], m["start_frame"]) for m in found], [("scissor_jump", "both", 31)])
 
 
 if __name__ == "__main__":

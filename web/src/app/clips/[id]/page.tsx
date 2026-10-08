@@ -5,6 +5,7 @@ import { AppHeader } from "@/components/app-header";
 import { requireMember } from "@/lib/auth";
 import { type ClipStatus, STATUS_LABELS } from "@/lib/clips";
 import type { Pt } from "@/lib/court";
+import type { MovementType } from "@/lib/movements";
 import { signDownload } from "@/lib/r2";
 import { createClient } from "@/lib/supabase/server";
 
@@ -109,14 +110,22 @@ export default async function ViewerPage({ params, searchParams }: PageProps<"/c
     signDownload(clip.playback_key, 6 * 3600),
     signDownload(`overlay/${rally.id}.json`, 6 * 3600),
   ]);
-  const { data: contacts } = subjects?.length
-    ? await supabase
-        .from("contacts")
-        .select("id, foot, start_frame, end_frame, zone, out_of_court, confidence, court_x_m, court_y_m")
-        .eq("subject_id", subjects[0].id)
-        .eq("deleted", false)
-        .order("start_frame")
-    : { data: [] };
+  const [{ data: contacts }, { data: movements }] = subjects?.length
+    ? await Promise.all([
+        supabase
+          .from("contacts")
+          .select("id, foot, start_frame, end_frame, zone, out_of_court, confidence, court_x_m, court_y_m")
+          .eq("subject_id", subjects[0].id)
+          .eq("deleted", false)
+          .order("start_frame"),
+        supabase
+          .from("movements")
+          .select("id, movement_type, foot, zone, start_frame, end_frame, confidence, details")
+          .eq("subject_id", subjects[0].id)
+          .eq("deleted", false)
+          .order("start_frame"),
+      ])
+    : [{ data: [] }, { data: [] }];
 
   return (
     <>
@@ -160,6 +169,16 @@ export default async function ViewerPage({ params, searchParams }: PageProps<"/c
             zone: c.zone,
             out: c.out_of_court,
             confidence: c.confidence === null ? null : Number(c.confidence),
+          }))}
+          movements={(movements ?? []).map((m) => ({
+            id: m.id,
+            type: m.movement_type as MovementType,
+            foot: m.foot as "L" | "R" | "both",
+            zone: m.zone,
+            start: m.start_frame,
+            end: m.end_frame,
+            confidence: m.confidence === null ? null : Number(m.confidence),
+            details: m.details as Record<string, number | string | boolean | null> | null,
           }))}
           corners={(calibration?.corners as Pt[] | undefined) ?? null}
           courtFit={rally.court_fit === null ? null : Number(rally.court_fit)}
